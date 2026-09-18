@@ -9,23 +9,39 @@
  *                      column set (this builds E[R, C] for all C), or
  *   mode 1 (read):     adds the table entry at the index of the *complement*
  *                      of the leaf's column set to a per-thread accumulator,
- *                      which is added to the item's sum at the end (this
- *                      computes sum over C of E[R, C] * O[R̅, C̅] for the item).
+ *                      which is added to the item's sum when the ticket is
+ *                      done (this computes sum over C of E[R, C] * O[R̅, C̅]).
  *
  * Table indexing is exactly SolutionTable's (src/solution_table.rs): split the
  * column mask into dense even/odd masks, colex-rank each with the two-level
  * tables, index = rank(even) * odd_stride + rank(odd).
  *
- * Parallelism: one thread per "ticket". A ticket fixes the columns of the
- * first NQ_PREFIX rows of R as a mixed-radix number (digit t chooses among the
- * colour-compatible columns of row t). Tickets whose prefix has a conflict
- * exit at once; the others run a depth-first search over the remaining rows,
- * identical to the CPU search. Many items share one launch: item i owns the
- * tickets [ticket_base[i], ticket_base[i + 1]), and a thread finds its item by
- * binary search.
+ * Work division: the work is cut into "tickets". A ticket fixes the columns
+ * of the first NQ_PREFIX rows of R as a mixed-radix number (digit t chooses
+ * among the colour-compatible columns of row t). Tickets whose prefix has a
+ * conflict are finished at once; the others run a depth-first search over
+ * the remaining rows, identical to the CPU search. Many items share one
+ * launch: item i owns the tickets [ticket_base[i], ticket_base[i + 1]), and
+ * a ticket finds its item by binary search.
  *
- * Baked in by the host at compile time: NQ_N (board size) and NQ_PREFIX
- * (prefix depth). All items in a launch share one mode and one colour.
+ * Thread organization: threads are persistent and the kernel body is one
+ * loop. Each iteration performs a single search step for the thread's
+ * current ticket; a thread whose search is exhausted takes the next
+ * unclaimed ticket from a shared counter and sets up its prefix, inside the
+ * same loop. Keeping every thread in the same loop keeps the lanes of a warp
+ * executing together, which matters because tickets differ enormously in
+ * cost.
+ *
+ * The DFS stack lives in shared memory: a thread's frame f is word
+ * [f][threadIdx.x] of five arrays, so the threads of a warp touch consecutive
+ * words (no bank conflicts). A frame holds the row being placed, the columns
+ * taken so far, the two diagonal masks shifted to that row, and the columns
+ * of that row still to try.
+ *
+ * Baked in by the host at compile time: NQ_N (board size), NQ_PREFIX (prefix
+ * depth), NQ_BLOCK (threads per block) and NQ_FRAMES (stack frames per
+ * thread, at least the largest row count minus NQ_PREFIX). All items in a
+ * launch share one mode and one colour.
  */
 typedef unsigned int u32;
 typedef unsigned long long u64;
@@ -70,6 +86,19 @@ __device__ __forceinline__ u32 table_index(u32 cols, u32 mode, u32 odd_stride,
     return rank16(even, rank_lo, rank_hi) * odd_stride + rank16(odd, rank_lo, rank_hi);
 }
 
+/* Color-compatible columns of row r: even columns when r has the colour's
+ * parity, odd columns otherwise (as `pmask` in the CPU enumerate). */
+__device__ __forceinline__ u32 row_columns(u32 r, u32 parity) {
+    return ((r & 1u) == parity) ? EVEN_COLS : ODD_COLS;
+}
+
+/* The DFS stack: frame f of the calling thread is word [f][threadIdx.x]. */
+__shared__ u32 st_row[NQ_FRAMES][NQ_BLOCK];    /* row being placed at this level */
+__shared__ u32 st_cols[NQ_FRAMES][NQ_BLOCK];   /* columns taken by the rows above */
+__shared__ u32 st_ld[NQ_FRAMES][NQ_BLOCK];     /* columns attacked along / diagonals, at this row */
+__shared__ u32 st_rd[NQ_FRAMES][NQ_BLOCK];     /* columns attacked along \ diagonals, at this row */
+__shared__ u32 st_free[NQ_FRAMES][NQ_BLOCK];   /* columns of this row still to try */
+
 extern "C" __global__ void enumerate_kernel(
     u32 mode,                                  /* 0: tabulate, 1: read (see above) */
     u32 parity,                                /* colour: 0 for r + c even, 1 for r + c odd */
@@ -81,85 +110,102 @@ extern "C" __global__ void enumerate_kernel(
     u32* __restrict__ tables,                  /* all tables of the batch, concatenated */
     u64* __restrict__ sums,                    /* [n_items] mode 1 results */
     const unsigned short* __restrict__ rank_lo,
-    const unsigned short* __restrict__ rank_hi)
+    const unsigned short* __restrict__ rank_hi,
+    u64* __restrict__ next_ticket)             /* shared ticket counter, zero at launch */
 {
-    /* ---- which item and which ticket within it ---- */
-    const u64 ticket = (u64)blockIdx.x * blockDim.x + threadIdx.x;
-    if (ticket >= ticket_base[n_items]) return;
-    u32 lo = 0, hi = n_items;                  /* invariant: ticket_base[lo] <= ticket < ticket_base[hi] */
-    while (hi - lo > 1u) {
-        const u32 mid = (lo + hi) / 2u;
-        if (ticket_base[mid] <= ticket) lo = mid; else hi = mid;
-    }
-    const u32 item = lo;
-    u64 local = ticket - ticket_base[item];
-    const u32 rows = item_rows[item];
-    const u32 odd_stride = item_odd_stride[item];
-    u32* table = tables + item_table[item];
-    u64 acc = 0;
+    const u32 tid = threadIdx.x;
+    const u64 total = ticket_base[n_items];
 
-    /* ---- per-level data, as in the CPU enumerate: rows of R in increasing
-     * order, colour-compatible column mask, gap to the next row of R ---- */
-    u32 row[32], pmask[32], gap[32];
-    u32 l = 0;
-    for (u32 m = rows; m != 0u; m &= m - 1u) row[l++] = __ffs(m) - 1u;
-    for (u32 t = 0; t < l; ++t) {
-        const u32 r = row[t];
-        pmask[t] = ((r & 1u) == parity) ? EVEN_COLS : ODD_COLS;
-        gap[t] = (t + 1u < l) ? row[t + 1u] - r : 0u;
-    }
+    /* The thread's current ticket. */
+    u32 item = 0, rows = 0, odd_stride = 0;
+    u32* table = tables;
+    u64 acc = 0;                               /* mode 1: table entries read for this item so far */
+    int f = -1;                                /* top stack frame; -1 = no ticket in progress */
 
-    /* ---- the prefix: decode the ticket into the first min(NQ_PREFIX, l) rows ---- */
-    const u32 depth = (NQ_PREFIX < l) ? NQ_PREFIX : l;
-    u32 cols = 0, ld = 0, rd = 0;
-    for (u32 t = 0; t < depth; ++t) {
-        const u32 col_parity = (row[t] & 1u) ^ parity;         /* columns c with c % 2 == col_parity */
-        const u32 radix = (col_parity == 0u) ? M_EVEN : M_ODD;
-        const u32 q = (u32)(local % radix);
-        local /= radix;
-        const u32 bit = 1u << (2u * q + col_parity);
-        if ((cols | ld | rd) & bit) return;                    /* dead prefix: nothing to count */
-        cols |= bit;
-        ld = (ld | bit) << gap[t];
-        rd = (rd | bit) >> gap[t];
-    }
+    for (;;) {
+        if (f < 0) {
+            /* ---- take the next ticket ---- */
+            if (mode == 1u && acc != 0ull) { atomicAdd(sums + item, acc); acc = 0; }
+            const u64 ticket = atomicAdd(next_ticket, 1ull);
+            if (ticket >= total) return;
 
-    if (depth == l) {
-        /* The prefix is the whole placement (this includes l == 0: the single
-         * empty placement, cols == 0). */
-        const u32 idx = table_index(cols, mode, odd_stride, rank_lo, rank_hi);
-        if (mode == 0u) atomicAdd(table + idx, 1u); else acc += table[idx];
-    } else {
-        /* ---- depth-first search over the remaining rows, as in the CPU
-         * enumerate; level t of the stack is row[t] ---- */
-        u32 st_free[32], st_cols[32], st_ld[32], st_rd[32];
-        u32 t = depth;
-        st_cols[t] = cols; st_ld[t] = ld; st_rd[t] = rd;
-        st_free[t] = pmask[t] & ~(cols | ld | rd);
-        const u32 last = l - 1u;
-        for (;;) {
-            const u32 free = st_free[t];
-            if (free == 0u) {
-                if (t == depth) break;
-                --t;
-                continue;
+            u32 lo = 0, hi = n_items;          /* invariant: ticket_base[lo] <= ticket < ticket_base[hi] */
+            while (hi - lo > 1u) {
+                const u32 mid = (lo + hi) / 2u;
+                if (ticket_base[mid] <= ticket) lo = mid; else hi = mid;
             }
-            const u32 bit = free & (0u - free);
-            st_free[t] = free ^ bit;
-            const u32 c = st_cols[t] | bit;
-            if (t == last) {
-                const u32 idx = table_index(c, mode, odd_stride, rank_lo, rank_hi);
+            item = lo;
+            rows = item_rows[item];
+            odd_stride = item_odd_stride[item];
+            table = tables + item_table[item];
+            u32 local = (u32)(ticket - ticket_base[item]);   /* the host keeps tickets per item below 2^32 */
+
+            /* ---- decode the prefix: the first min(NQ_PREFIX, |R|) rows ---- */
+            const u32 l = __popc(rows);
+            const u32 depth = (NQ_PREFIX < l) ? NQ_PREFIX : l;
+            u32 rest = rows;                   /* rows of R not yet placed */
+            u32 cols = 0, ld = 0, rd = 0;
+            bool dead = false;
+            for (u32 t = 0; t < depth && !dead; ++t) {
+                const u32 r = __ffs(rest) - 1u;
+                rest &= rest - 1u;
+                const u32 col_parity = (r & 1u) ^ parity;         /* columns c with c % 2 == col_parity */
+                const u32 radix = (col_parity == 0u) ? M_EVEN : M_ODD;
+                const u32 q = local % radix;
+                local /= radix;
+                const u32 bit = 1u << (2u * q + col_parity);
+                dead = ((cols | ld | rd) & bit) != 0u;
+                cols |= bit;
+                const u32 gap = (rest != 0u) ? (__ffs(rest) - 1u) - r : 0u;
+                ld = (ld | bit) << gap;
+                rd = (rd | bit) >> gap;
+            }
+            if (dead) continue;                /* a conflict within the prefix: nothing to count */
+
+            if (rest == 0u) {
+                /* The prefix is the whole placement (including |R| == 0: the
+                 * single empty placement, cols == 0). */
+                const u32 idx = table_index(cols, mode, odd_stride, rank_lo, rank_hi);
                 if (mode == 0u) atomicAdd(table + idx, 1u); else acc += table[idx];
                 continue;
             }
-            const u32 sh = gap[t];
-            const u32 nld = (st_ld[t] | bit) << sh;
-            const u32 nrd = (st_rd[t] | bit) >> sh;
-            ++t;
-            st_cols[t] = c; st_ld[t] = nld; st_rd[t] = nrd;
-            st_free[t] = pmask[t] & ~(c | nld | nrd);
-        }
-    }
 
-    if (mode == 1u && acc != 0ull) atomicAdd(sums + item, acc);
+            /* ---- start the search at the first row after the prefix ---- */
+            const u32 r = __ffs(rest) - 1u;
+            f = 0;
+            st_row[0][tid] = r;
+            st_cols[0][tid] = cols;
+            st_ld[0][tid] = ld;
+            st_rd[0][tid] = rd;
+            st_free[0][tid] = row_columns(r, parity) & ~(cols | ld | rd);
+            continue;
+        }
+
+        /* ---- one search step, as in the CPU enumerate ---- */
+        const u32 free = st_free[f][tid];
+        if (free == 0u) {                      /* this row is exhausted: back up */
+            --f;
+            continue;
+        }
+        const u32 bit = free & (0u - free);    /* try the lowest remaining column */
+        st_free[f][tid] = free ^ bit;
+        const u32 c = st_cols[f][tid] | bit;
+        const u32 r = st_row[f][tid];
+        const u32 later = rows >> (r + 1u);    /* rows of R after r */
+        if (later == 0u) {                     /* r is the last row: a complete placement */
+            const u32 idx = table_index(c, mode, odd_stride, rank_lo, rank_hi);
+            if (mode == 0u) atomicAdd(table + idx, 1u); else acc += table[idx];
+            continue;
+        }
+        const u32 gap = __ffs(later);          /* distance to the next row of R */
+        const u32 nr = r + gap;
+        const u32 nld = (st_ld[f][tid] | bit) << gap;
+        const u32 nrd = (st_rd[f][tid] | bit) >> gap;
+        ++f;
+        st_row[f][tid] = nr;
+        st_cols[f][tid] = c;
+        st_ld[f][tid] = nld;
+        st_rd[f][tid] = nrd;
+        st_free[f][tid] = row_columns(nr, parity) & ~(c | nld | nrd);
+    }
 }

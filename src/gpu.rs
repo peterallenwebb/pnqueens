@@ -34,7 +34,34 @@ use std::time::Instant;
 const KERNEL_SRC: &str = include_str!("../kernel/enumerate.cu");
 const KERNEL_NAME: &str = "enumerate_kernel";
 const MODULE_NAME: &str = "pnqueens";
-const BLOCK_SIZE: u32 = 128;
+/// Static shared memory available to one block on every supported GPU.
+const SHARED_MEMORY_LIMIT: u32 = 48 * 1024;
+/// Bytes of shared memory per stack frame per thread (five u32 words).
+const FRAME_BYTES: u32 = 20;
+
+/// Threads per block and stack frames per thread for the kernel. A row set
+/// has at most n rows, and the DFS below the prefix needs one frame per row
+/// after it, so n - prefix frames always suffice. Blocks are 128 threads
+/// when their stacks fit the static shared-memory limit, else 64.
+fn block_shape(n: u32, prefix_depth: u32) -> (u32, u32) {
+    let frames = n.saturating_sub(prefix_depth).max(1);
+    let block = if 128 * frames * FRAME_BYTES <= SHARED_MEMORY_LIMIT { 128 } else { 64 };
+    (block, frames)
+}
+
+/// Number of blocks to launch: the kernel's threads are persistent (each
+/// loops over tickets), so we launch just enough blocks to fill every
+/// multiprocessor, as limited by its shared memory and thread capacity.
+fn grid_size(dev: &CudaDevice, block_size: u32, frames: u32) -> Result<u32, String> {
+    use cudarc::driver::sys::CUdevice_attribute::*;
+    let attr = |a| dev.attribute(a).map_err(cuda_err).map(|v| v as u32);
+    let sms = attr(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?;
+    let shared_per_sm = attr(CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR)?;
+    let threads_per_sm = attr(CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR)?;
+    let by_shared = shared_per_sm / (block_size * frames * FRAME_BYTES);
+    let by_threads = threads_per_sm / block_size;
+    Ok(sms * by_shared.min(by_threads).max(1))
+}
 
 pub struct GpuOptions {
     /// CUDA device index.
@@ -97,10 +124,6 @@ impl Launch {
         let next = self.ticket_base.last().unwrap() + tickets;
         self.ticket_base.push(next);
     }
-
-    fn total_tickets(&self) -> u64 {
-        *self.ticket_base.last().unwrap()
-    }
 }
 
 /// Q(n) computed on the GPU. Every row set's count is recorded in `log`
@@ -110,6 +133,11 @@ pub fn count_queens_gpu(n: u32, opts: &GpuOptions, log: &mut RowsetLog) -> Resul
     let start = Instant::now();
     if opts.prefix_depth == 0 {
         return Err("prefix depth must be at least 1".into());
+    }
+    // The kernel decodes a ticket's position within its item in 32 bits.
+    let max_tickets = u64::from(n.div_ceil(2)).pow(opts.prefix_depth);
+    if max_tickets > u64::from(u32::MAX) {
+        return Err(format!("prefix depth {} gives up to {max_tickets} tickets per row set; the limit is 2^32", opts.prefix_depth));
     }
 
     // ---- work items, heaviest tables first so each batch holds items of similar size
@@ -133,13 +161,19 @@ pub fn count_queens_gpu(n: u32, opts: &GpuOptions, log: &mut RowsetLog) -> Resul
     // ---- device setup: compile the kernel for this n, upload the rank tables
     let dev = CudaDevice::new(opts.device).map_err(cuda_err)?;
     println!("device: CUDA {} ({})", opts.device, dev.name().map_err(cuda_err)?);
+    let (block_size, frames) = block_shape(n, opts.prefix_depth);
+    let grid_size = grid_size(&dev, block_size, frames)?;
     println!(
-        "gpu: prefix depth {}, table budget {} MiB, block size {BLOCK_SIZE}",
+        "gpu: prefix depth {}, table budget {} MiB, {grid_size} blocks of {block_size} threads, {frames} stack frames ({} KiB shared memory per block)",
         opts.prefix_depth,
-        opts.table_budget_bytes >> 20
+        opts.table_budget_bytes >> 20,
+        block_size * frames * FRAME_BYTES / 1024
     );
 
-    let src = format!("#define NQ_N {n}u\n#define NQ_PREFIX {}u\n{KERNEL_SRC}", opts.prefix_depth);
+    let src = format!(
+        "#define NQ_N {n}u\n#define NQ_PREFIX {}u\n#define NQ_BLOCK {block_size}u\n#define NQ_FRAMES {frames}u\n{KERNEL_SRC}",
+        opts.prefix_depth
+    );
     let ptx = compile_ptx_with_opts(src, CompileOptions::default())
         .map_err(|e| format!("kernel compilation failed:\n{e}"))?;
     dev.load_ptx(ptx, MODULE_NAME, &[KERNEL_NAME]).map_err(cuda_err)?;
@@ -149,6 +183,7 @@ pub fn count_queens_gpu(n: u32, opts: &GpuOptions, log: &mut RowsetLog) -> Resul
     let rank_hi_flat: Vec<u16> = RANK_HI.iter().flatten().copied().collect();
     let rank_hi_d: CudaSlice<u16> = dev.htod_sync_copy(&rank_hi_flat).map_err(cuda_err)?;
     let mut tables_d: CudaSlice<u32> = dev.alloc_zeros(budget_entries).map_err(cuda_err)?;
+    let mut next_ticket_d: CudaSlice<u64> = dev.alloc_zeros(1).map_err(cuda_err)?;
 
     // ---- batches
     let mut next_item = 0;
@@ -190,11 +225,9 @@ pub fn count_queens_gpu(n: u32, opts: &GpuOptions, log: &mut RowsetLog) -> Resul
             let offset_d = dev.htod_sync_copy(&launch.table_offset).map_err(cuda_err)?;
             let stride_d = dev.htod_sync_copy(&launch.odd_stride).map_err(cuda_err)?;
             let base_d = dev.htod_sync_copy(&launch.ticket_base).map_err(cuda_err)?;
-            let threads = launch.total_tickets();
-            let blocks = threads.div_ceil(u64::from(BLOCK_SIZE));
-            let blocks = u32::try_from(blocks).map_err(|_| format!("{threads} tickets exceed the grid size limit"))?;
-            let cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (BLOCK_SIZE, 1, 1), shared_mem_bytes: 0 };
+            let cfg = LaunchConfig { grid_dim: (grid_size, 1, 1), block_dim: (block_size, 1, 1), shared_mem_bytes: 0 };
             let parity = mode; // even squares for the tabulate launch, odd for the read launch
+            dev.memset_zeros(&mut next_ticket_d).map_err(cuda_err)?;
             unsafe {
                 kernel
                     .clone()
@@ -212,6 +245,7 @@ pub fn count_queens_gpu(n: u32, opts: &GpuOptions, log: &mut RowsetLog) -> Resul
                             &mut sums_d,
                             &rank_lo_d,
                             &rank_hi_d,
+                            &mut next_ticket_d,
                         ),
                     )
                     .map_err(cuda_err)?;
