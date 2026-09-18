@@ -53,6 +53,14 @@
 //! Note also:
 //! E[R, C] = E[R, rev C] for odd n, since the mirror preserves color (exploit inside sum)
 //! E[R, C] = O[R, rev C] for even n, by horizontal reflection, which exchanges colors
+//!
+//! The first of these is used inside the sum for odd n. The mirror c -> n-1-c
+//! fixes R and preserves colour, so it pairs each odd-square placement on R̅
+//! (column set C̅) with its mirror image (column set rev C̅), and both look up
+//! the same value E[R, C] = E[R, rev C]. The odd-square search therefore
+//! places the queen of its first row only in columns left of centre, counting
+//! each placement twice, plus the centre column, counted once. See
+//! `backtrack_odd_solutions` and `mirror_columns`.
 
 #[cfg(feature = "cuda")]
 mod gpu;
@@ -286,7 +294,7 @@ fn count_solutions(n: u32, even_queen_rows: &RowCombo) -> u64 {
 // zero), so the caller can skip the odd-square search.
 fn get_erc(n: u32, row_bitmask: u32) -> Option<SolutionTable> {
     let mut table = SolutionTable::for_rows(n, row_bitmask, 0);
-    let leaves = enumerate(n, row_bitmask, 0, |cols| {
+    let leaves = enumerate(n, row_bitmask, 0, u32::MAX, |cols| {
         let (even, odd) = split_columns(cols);
         table.increment_dense(even, odd);
     });
@@ -310,17 +318,40 @@ fn reflect(n: u32, x: u32) -> u32 {
 fn backtrack_odd_solutions(n: u32, erc: &SolutionTable, rcomp: u32) -> u64 {
     // Same enumeration as get_erc, but on odd squares; a leaf with column set
     // C̅ contributes E[R, C] where C is the complement of C̅.
-    let mut total = 0u64;
-    enumerate(n, rcomp, 1, |cols| {
-        let (even, odd) = split_columns(cols);
-        total += erc.get_complement_dense(even, odd) as u64;
-    });
-    total
+    let count = |first_row_columns: u32| {
+        let mut total = 0u64;
+        enumerate(n, rcomp, 1, first_row_columns, |cols| {
+            let (even, odd) = split_columns(cols);
+            total += erc.get_complement_dense(even, odd) as u64;
+        });
+        total
+    };
+    match mirror_columns(n, rcomp) {
+        // Odd n (see the module docs): placements with the first queen left
+        // of centre stand for themselves and their mirror images.
+        Some((left, centre)) => 2 * count(left) + count(centre),
+        None => count(u32::MAX),
+    }
+}
+
+// The column masks the odd-square search restricts its first row to, when the
+// mirror symmetry applies: (columns left of centre, the centre column). It
+// applies for odd n, where the mirror c -> n-1-c preserves square colour;
+// for even n it swaps colours and cannot be used this way. It also needs a
+// first row to restrict: with no rows there is one empty placement, which is
+// its own mirror image and must be counted once.
+fn mirror_columns(n: u32, rows: u32) -> Option<(u32, u32)> {
+    if n % 2 == 0 || rows == 0 {
+        return None;
+    }
+    let mid = (n - 1) / 2;
+    Some(((1 << mid) - 1, 1 << mid))
 }
 
 // Enumerates every placement of one queen per row of `rows`, all on squares of
 // the given parity and mutually non-attacking, calling `leaf(cols)` with the
-// column bitmask of each. Returns the number of leaves.
+// column bitmask of each. Returns the number of leaves. The queen of the first
+// row is restricted to `first_row_columns` (pass u32::MAX for no restriction).
 //
 // The search is an explicit-stack depth-first search over the rows of R only.
 // Level t holds the row r_t; `pmask[t]` is the colour-compatible column mask
@@ -328,7 +359,7 @@ fn backtrack_odd_solutions(n: u32, erc: &SolutionTable, rcomp: u32) -> u64 {
 // `rd` are the attacked columns and the two diagonal families as seen from the
 // current row, so stepping to the next row of R shifts the diagonals by the
 // gap. `st_free[t]` holds the candidates not yet tried at level t.
-fn enumerate(n: u32, rows: u32, parity: u32, mut leaf: impl FnMut(u32)) -> u64 {
+fn enumerate(n: u32, rows: u32, parity: u32, first_row_columns: u32, mut leaf: impl FnMut(u32)) -> u64 {
     let full: u32 = (1 << n) - 1;
 
     let mut row = [0u32; 32];
@@ -358,7 +389,7 @@ fn enumerate(n: u32, rows: u32, parity: u32, mut leaf: impl FnMut(u32)) -> u64 {
     let mut st_cols = [0u32; 32];
     let mut st_ld = [0u32; 32];
     let mut st_rd = [0u32; 32];
-    st_free[0] = pmask[0];
+    st_free[0] = pmask[0] & first_row_columns;
     let last = l - 1;
     let mut leaves = 0u64;
     let mut t = 0usize;

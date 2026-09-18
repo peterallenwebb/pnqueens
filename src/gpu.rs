@@ -85,11 +85,21 @@ fn cuda_err(e: impl std::fmt::Display) -> String {
     format!("CUDA error: {e}")
 }
 
+/// Whether the kernel applies the mirror symmetry of `backtrack_odd_solutions`
+/// to the read side: odd n only (n = 1 has no read-side rows to restrict).
+fn uses_mirror(n: u32) -> bool {
+    n % 2 == 1 && n >= 3
+}
+
 /// Number of tickets for one search: the product, over the first
-/// `prefix_depth` rows of `rows`, of the number of colour-compatible columns
-/// in that row. This must match the kernel's prefix decoding exactly.
+/// `prefix_depth` rows of `rows`, of the number of columns the ticket digit
+/// for that row ranges over. That is the colour-compatible columns of the
+/// row, except that with the mirror symmetry the first row of a read-side
+/// (odd-square) search is limited to the columns up to the centre. This must
+/// match the kernel's prefix decoding exactly.
 fn ticket_count(n: u32, rows: u32, parity: u32, prefix_depth: u32) -> u64 {
-    let (m_even, m_odd) = (u64::from(n.div_ceil(2)), u64::from(n / 2));
+    let (m_even, m_odd) = (n.div_ceil(2), n / 2);
+    let mid = (n - 1) / 2;
     let mut count = 1u64;
     let mut m = rows;
     let mut taken = 0;
@@ -97,7 +107,14 @@ fn ticket_count(n: u32, rows: u32, parity: u32, prefix_depth: u32) -> u64 {
         let r = m.trailing_zeros();
         m &= m - 1;
         let col_parity = (r & 1) ^ parity;
-        count *= if col_parity == 0 { m_even } else { m_odd };
+        let radix = if taken == 0 && parity == 1 && uses_mirror(n) {
+            (mid - col_parity) / 2 + 1
+        } else if col_parity == 0 {
+            m_even
+        } else {
+            m_odd
+        };
+        count *= u64::from(radix);
         taken += 1;
     }
     count
@@ -171,8 +188,9 @@ pub fn count_queens_gpu(n: u32, opts: &GpuOptions, log: &mut RowsetLog) -> Resul
     );
 
     let src = format!(
-        "#define NQ_N {n}u\n#define NQ_PREFIX {}u\n#define NQ_BLOCK {block_size}u\n#define NQ_FRAMES {frames}u\n{KERNEL_SRC}",
-        opts.prefix_depth
+        "#define NQ_N {n}u\n#define NQ_PREFIX {}u\n#define NQ_BLOCK {block_size}u\n#define NQ_FRAMES {frames}u\n#define NQ_MIRROR {}\n{KERNEL_SRC}",
+        opts.prefix_depth,
+        u32::from(uses_mirror(n))
     );
     let ptx = compile_ptx_with_opts(src, CompileOptions::default())
         .map_err(|e| format!("kernel compilation failed:\n{e}"))?;
@@ -284,8 +302,16 @@ mod tests {
         assert_eq!(ticket_count(7, 0b11001, 0, 2), 12);
         assert_eq!(ticket_count(7, 0b11001, 0, 3), 48);
         assert_eq!(ticket_count(7, 0b11001, 0, 10), 48, "prefix deeper than |R| stops at |R|");
-        // Odd squares swap the column parities.
-        assert_eq!(ticket_count(7, 0b11001, 1, 3), 3 * 4 * 3);
+        // Odd squares swap the column parities, and for odd n the first row
+        // of the odd-square search is limited to the columns up to the centre
+        // (n = 7: centre column 3; row 0 uses odd columns, so {1, 3}).
+        assert_eq!(ticket_count(7, 0b11001, 1, 3), 2 * 4 * 3);
+        // n = 9, centre 4: row 0 on odd squares uses odd columns {1, 3};
+        // row 1 uses even columns {0, 2, 4}.
+        assert_eq!(ticket_count(9, 0b01, 1, 1), 2);
+        assert_eq!(ticket_count(9, 0b10, 1, 1), 3);
+        // Even n: no mirror restriction on the odd-square search.
+        assert_eq!(ticket_count(8, 0b11001, 1, 3), 4 * 4 * 4);
         // No rows: a single ticket.
         assert_eq!(ticket_count(7, 0, 0, 3), 1);
     }

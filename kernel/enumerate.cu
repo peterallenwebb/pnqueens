@@ -38,10 +38,16 @@
  * taken so far, the two diagonal masks shifted to that row, and the columns
  * of that row still to try.
  *
+ * Mirror symmetry (NQ_MIRROR, set by the host for odd n): as in the CPU
+ * `backtrack_odd_solutions`, the read-side search places its first row's
+ * queen only in columns up to the centre; a placement left of centre counts
+ * for itself and its mirror image (weight 2), one in the centre column for
+ * itself (weight 1). The first prefix digit ranges over just those columns.
+ *
  * Baked in by the host at compile time: NQ_N (board size), NQ_PREFIX (prefix
- * depth), NQ_BLOCK (threads per block) and NQ_FRAMES (stack frames per
- * thread, at least the largest row count minus NQ_PREFIX). All items in a
- * launch share one mode and one colour.
+ * depth), NQ_BLOCK (threads per block), NQ_FRAMES (stack frames per thread,
+ * at least the largest row count minus NQ_PREFIX) and NQ_MIRROR (0 or 1).
+ * All items in a launch share one mode and one colour.
  */
 typedef unsigned int u32;
 typedef unsigned long long u64;
@@ -53,6 +59,7 @@ typedef unsigned long long u64;
 #define M_ODD     (NQ_N / 2u)                 /* number of odd columns */
 #define EVEN_FULL ((1u << M_EVEN) - 1u)       /* dense mask of all even columns */
 #define ODD_FULL  ((1u << M_ODD) - 1u)        /* dense mask of all odd columns */
+#define MID       ((NQ_N - 1u) / 2u)          /* the centre column (odd n) */
 
 /* Gathers the even-position bits of x into the low 16 bits (bit 2i -> bit i).
  * Same as solution_table::gather_even_bits. */
@@ -119,7 +126,8 @@ extern "C" __global__ void enumerate_kernel(
     /* The thread's current ticket. */
     u32 item = 0, rows = 0, odd_stride = 0;
     u32* table = tables;
-    u64 acc = 0;                               /* mode 1: table entries read for this item so far */
+    u32 weight = 1;                            /* mode 1: placements this ticket stands for (mirror symmetry) */
+    u64 acc = 0;                               /* mode 1: weighted table entries read for this item so far */
     int f = -1;                                /* top stack frame; -1 = no ticket in progress */
 
     for (;;) {
@@ -146,14 +154,22 @@ extern "C" __global__ void enumerate_kernel(
             u32 rest = rows;                   /* rows of R not yet placed */
             u32 cols = 0, ld = 0, rd = 0;
             bool dead = false;
+            weight = 1;
             for (u32 t = 0; t < depth && !dead; ++t) {
                 const u32 r = __ffs(rest) - 1u;
                 rest &= rest - 1u;
                 const u32 col_parity = (r & 1u) ^ parity;         /* columns c with c % 2 == col_parity */
-                const u32 radix = (col_parity == 0u) ? M_EVEN : M_ODD;
+                u32 radix = (col_parity == 0u) ? M_EVEN : M_ODD;  /* columns of that parity on the board */
+#if NQ_MIRROR
+                if (mode == 1u && t == 0u) radix = (MID - col_parity) / 2u + 1u;   /* ... up to the centre */
+#endif
                 const u32 q = local % radix;
                 local /= radix;
-                const u32 bit = 1u << (2u * q + col_parity);
+                const u32 c = 2u * q + col_parity;
+                const u32 bit = 1u << c;
+#if NQ_MIRROR
+                if (mode == 1u && t == 0u) weight = (c == MID) ? 1u : 2u;
+#endif
                 dead = ((cols | ld | rd) & bit) != 0u;
                 cols |= bit;
                 const u32 gap = (rest != 0u) ? (__ffs(rest) - 1u) - r : 0u;
@@ -166,7 +182,7 @@ extern "C" __global__ void enumerate_kernel(
                 /* The prefix is the whole placement (including |R| == 0: the
                  * single empty placement, cols == 0). */
                 const u32 idx = table_index(cols, mode, odd_stride, rank_lo, rank_hi);
-                if (mode == 0u) atomicAdd(table + idx, 1u); else acc += table[idx];
+                if (mode == 0u) atomicAdd(table + idx, 1u); else acc += (u64)weight * table[idx];
                 continue;
             }
 
@@ -194,7 +210,7 @@ extern "C" __global__ void enumerate_kernel(
         const u32 later = rows >> (r + 1u);    /* rows of R after r */
         if (later == 0u) {                     /* r is the last row: a complete placement */
             const u32 idx = table_index(c, mode, odd_stride, rank_lo, rank_hi);
-            if (mode == 0u) atomicAdd(table + idx, 1u); else acc += table[idx];
+            if (mode == 0u) atomicAdd(table + idx, 1u); else acc += (u64)weight * table[idx];
             continue;
         }
         const u32 gap = __ffs(later);          /* distance to the next row of R */
