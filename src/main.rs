@@ -132,7 +132,7 @@ fn fail(msg: &str) -> ! {
 fn count_queens_on_gpu(args: &Args, log: &mut RowsetLog) {
     let opts = gpu::GpuOptions {
         device: args.device,
-        prefix_depth: args.prefix_depth.unwrap_or_else(|| gpu::GpuOptions::default_prefix_depth(args.n)),
+        prefix_depth: args.prefix_depth,
         table_budget_bytes: args.table_mem_mib << 20,
     };
     gpu::count_queens_gpu(args.n, &opts, log).unwrap_or_else(|e| fail(&e));
@@ -202,7 +202,7 @@ fn parse_args() -> Args {
              \x20 1 <= n <= 31\n\
              \x20 --cuda        Run on a CUDA GPU (build with --features cuda)\n\
              \x20 --device I    (CUDA mode only) CUDA device index (default 0)\n\
-             \x20 --prefix P    (CUDA mode only) Rows fixed per GPU thread (default 3, +1 at n >= 24, +1 at n >= 28)\n\
+             \x20 --prefix P    (CUDA mode only) Rows fixed per GPU ticket (default: the least that keeps the tables in flight within L2)\n\
              \x20 --table-mem M (CUDA mode only) Device memory for tables per batch, MiB (default 8192)\n\
              \x20 --out FILE    Per-row-set counts, CSV (default rowsets_<n>.csv; never overwritten)\n\
              \x20 --sum FILE... Re-tabulate Q(n) from row-set files and check they are complete",
