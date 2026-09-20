@@ -22,6 +22,13 @@ static inline int __popc(unsigned x) { return __builtin_popcount(x); }
 static inline int __ffs(unsigned x) { return __builtin_ffs((int)x); }
 static inline int __clz(unsigned x) { return x ? __builtin_clz(x) : 32; }
 template <class T> static T atomicAdd(T* p, T v) { T old = *p; *p += v; return old; }
+/* Warp intrinsics for a warp of one lane (lane 0). */
+template <class T> static T __shfl_sync(unsigned, T v, unsigned) { return v; }
+static inline unsigned __ballot_sync(unsigned, bool pred) { return pred ? 1u : 0u; }
+static inline unsigned __fns(unsigned mask, unsigned base, int offset) {   /* position of the offset-th set bit at or after base */
+    for (unsigned i = base; i < 32; ++i) if ((mask >> i) & 1u && --offset == 0) return i;
+    return 0xffffffffu;
+}
 
 static unsigned emu_n, emu_prefix, emu_mirror;
 #define NQ_N      emu_n

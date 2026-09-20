@@ -26,8 +26,13 @@ pub const MIN_PREFIX_DEPTH: u32 = 3;
 /// Tickets in progress at a moment, as a multiple of the resident threads.
 /// Threads take tickets in order, but a slow ticket keeps its thread on an
 /// old item while the others move on, so the window is wider than one per
-/// thread.
-const TICKET_WINDOW_FACTOR: u64 = 2;
+/// thread; and each warp's pool holds up to one more decoded ticket per lane.
+const TICKET_WINDOW_FACTOR: u64 = 3;
+
+/// The share of the L2 cache the tables in flight may occupy before the
+/// table updates start missing. Measured on an RTX 5090 (cuda-notes.md 2.9):
+/// 15 MB of tables in flight runs at full speed, 30 MB does not.
+const L2_SHARE: (u64, u64) = (1, 4);
 
 /// The feasible even-queen row sets with their symmetry weights, heaviest
 /// table first, so that each batch holds items of similar size.
@@ -87,16 +92,18 @@ pub fn ticket_count(n: u32, rows: u32, parity: u32, prefix_depth: u32) -> u64 {
 }
 
 /// The default prefix depth for this board and GPU: the smallest depth at
-/// which the tables of the items in flight fit the L2 cache.
+/// which the tables of the items in flight fit the share of the L2 cache
+/// that keeps table updates cheap.
 ///
 /// About `threads` tickets are in progress at any moment (times the window
 /// factor), consecutive ones, so the items in flight number about window /
 /// tickets-per-item, and the kernel's table updates are spread over their
-/// tables. While those fit L2 the updates are cheap; once they spill,
-/// every update is a DRAM access and the kernel runs at half speed or worse
-/// (measured at n = 23: 235 s with depth 3, 109 s with depth 4). Deeper
-/// prefixes cost setup work for their many more, mostly dead, tickets, so
-/// the depth is no larger than this needs. The heaviest item stands for all.
+/// tables. While those fit the L2 share the updates are cheap; once they
+/// spill, updates become DRAM read-modify-writes and the kernel runs at
+/// half speed or worse (n = 23: 235 s at depth 3, 109 s at depth 4; n = 22
+/// at 36 warps per SM: 15 s at depth 4, 9 s at depth 5). Deeper prefixes
+/// cost decoding work for their many more, mostly dead, tickets, so the
+/// depth is no larger than this needs. The heaviest item stands for all.
 pub fn default_prefix_depth(n: u32, heaviest: &RowCombo, threads: u32, l2_bytes: u64) -> u32 {
     let table_bytes = (table_entries(n, heaviest.mask) * ENTRY_BYTES) as u64;
     let window = TICKET_WINDOW_FACTOR * u64::from(threads);
@@ -109,7 +116,7 @@ pub fn default_prefix_depth(n: u32, heaviest: &RowCombo, threads: u32, l2_bytes:
         let deeper_is_allowed = depth < n && next <= u64::from(u32::MAX);
         // Stop when the tables fit, or when going deeper cannot help: one
         // item in flight is the least possible.
-        if items_in_flight * table_bytes <= l2_bytes * 3 / 4 || items_in_flight <= 1 || !deeper_is_allowed {
+        if items_in_flight * table_bytes <= l2_bytes * L2_SHARE.0 / L2_SHARE.1 || items_in_flight <= 1 || !deeper_is_allowed {
             return depth;
         }
         depth += 1;
@@ -275,13 +282,14 @@ mod tests {
 
     #[test]
     fn default_prefix_depth_on_a_5090() {
-        // 170 SMs at 256 resident threads, 96 MB of L2: depth 3 up to n = 22,
-        // 4 for n = 23..26, 5 for n = 27..29 (see cuda-notes.md).
-        let threads = 170 * 256;
+        // 170 SMs at full residency (1536 threads per SM), 96 MB of L2. Depth 5
+        // from n = 22 (measured best at n = 22..24), 6 from n = 25 (the mirror
+        // leaves the odd-square search fewer tickets per item) and, from n = 28,
+        // because even one heaviest table in flight is more than the L2 share.
         let l2 = 96 << 20;
-        for (n, depth) in [(20, 3), (22, 3), (23, 4), (24, 4), (26, 4), (27, 5), (28, 5), (29, 5)] {
+        for (n, depth) in [(20, 4), (22, 5), (23, 5), (24, 5), (25, 6), (26, 6), (27, 6), (28, 6), (29, 6)] {
             let items = work_items(n);
-            assert_eq!(default_prefix_depth(n, &items[0], threads, l2), depth, "n = {n}");
+            assert_eq!(default_prefix_depth(n, &items[0], 170 * 1536, l2), depth, "n = {n}");
         }
     }
 }

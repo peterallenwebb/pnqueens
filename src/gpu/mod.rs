@@ -50,6 +50,9 @@ pub struct GpuOptions {
     pub prefix_depth: Option<u32>,
     /// Device memory for one batch's tables (both colours together), in bytes.
     pub table_budget_bytes: usize,
+    /// Blocks of the enumerate kernel to keep resident per multiprocessor;
+    /// None means as many as fit. Fewer is only useful for measurements.
+    pub blocks_per_sm: Option<u32>,
 }
 
 /// Q(n) computed on the GPU. Every row set's count is recorded in `log`

@@ -61,11 +61,23 @@ The whole kernel body is one loop in which each iteration is either a ticket
 setup or a single search step, so the lanes of a warp stay together even
 though tickets differ enormously in cost.
 
-The DFS stack lives in shared memory, frame `f` of thread `t` at word
-`[f][t]` of four arrays (columns taken, the two diagonal masks, columns of
-the row still to try). The frame's row is kept in a register and recomputed
-on pop (previous set bit of the row mask). Shared memory per thread is what
-bounds residency, so frames are kept to four words.
+The search state (columns taken, the two diagonal families, the row being
+placed and its columns still to try) lives in registers. The diagonals are
+kept in board coordinates as two 64-bit masks (bit `c - r + n - 1` and bit
+`c + r`), so placing and removing a queen are the same XOR and a pop
+recomputes the parent's state from the child's; a stack frame is one byte
+per thread (the column placed) in shared memory. Residency is then bounded
+by registers (53–56 → 9 blocks of 128 per SM, 36 warps), not shared memory.
+
+Ticket setup (item lookup, prefix decode, discarding dead tickets) is done
+per warp, all lanes together: when a lane needs work and the warp's pool is
+empty, lane 0 claims 32 consecutive tickets, every lane decodes one, and the
+live prefixes go to a per-warp pool in shared memory; a lane then picks one
+up with a few loads. Which lanes need work and which pool slots are live is
+tracked with warp votes at the top of every iteration. (Per-lane setup was
+measured to cost far more than its instruction count: a lane in the long
+setup path makes the whole warp wait, and at prefix 4–5 most tickets are
+dead, so some lane was in it almost every iteration.)
 
 Mirror symmetry for odd n (`NQ_MIRROR`): the odd-square search restricts the
 first row's queen to columns up to the centre; a leaf left of centre has
@@ -197,6 +209,122 @@ n = 27 ≈ 37 h, Q(28) ≈ 150–170 5090-hours and Q(29) ≈ 1550–1900 h.
 Unmeasured risk: the heaviest table is 47 MB at n = 28 and 88 MB at n = 29
 against a 96 MB L2; if the atomics spill to DRAM the n = 23 depth-3
 experience says up to ~2× slower. An n = 26 run would pin the exponent.
+
+### 2.8 Hardware counters at last (2026-09-20)
+
+A vast.ai *VM* (Ubuntu 22.04, driver 580.105, root) allows profiling, unlike
+the earlier containers. Nsight Compute 2026.3.1 and the CUDA 12.8 pieces
+(`cuda-nvrtc-12-8`, `cuda-nvrtc-dev-12-8`, `cuda-nvcc-12-8`,
+`cuda-cuobjdump-12-8`, `cuda-nvdisasm-12-8`) come from the NVIDIA apt repo
+that the image already has configured; `ncu` lives in
+`/opt/nvidia/nsight-compute/2026.3.1`. Note the report extension is now
+`.ncu-repz`.
+
+Ladder after the clarity refactor of the same day, kernel time
+(even + odd + join), all counts correct:
+
+| n | time | steps/s even / odd |
+|---|---|---|
+| 20 | 0.49 s | 1.3 / 1.7 × 10¹¹ |
+| 21 | 3.5 s | 1.8 / 1.5 × 10¹¹ |
+| 22 | 12.5 s | 1.7 / 1.8 × 10¹¹ |
+| 23 | 104 s | 1.7 / 1.7 × 10¹¹ |
+| 24 | 383 s | 1.8 / 1.9 × 10¹¹ |
+
+Same as before the refactor (2.7). The GPU held 2.58–2.85 GHz at 290–480 W
+of its 575 W limit, 75 °C: no throttling. Dead tickets: 48–51% at prefix 3,
+70–72% at prefix 4.
+
+Static (ptxas for sm_120 from generic PTX, as NVRTC + driver JIT do it):
+376 SASS instructions, 37 registers, no spills, 38.9 KB static shared
+memory per 128-thread block; 4 LDS, 9 STS, 16 LDG, 6 RED, 1 ATOM, 19 BRA,
+9 BSSY/BSYNC. Compiling directly for sm_120 gives 368 instructions and 38
+registers, so a `--gpu-architecture` option is not a lever.
+
+`ncu` on the first even and odd launches of n = 22 (`--table-mem 4096`,
+`--clock-control none`), both launches alike:
+
+| metric | value |
+|---|---|
+| issue slots busy | 39% (one instruction per 2.5 cycles per scheduler) |
+| active warps per scheduler | 2.0 of 12 (theoretical occupancy 16.7%, limited by shared memory) |
+| eligible warps per scheduler | 0.47; 60% of cycles have no eligible warp |
+| warp cycles per issued instruction | 5.0: 1.0 issuing, 1.7 fixed-latency dependency, 0.71 short scoreboard (shared memory), 0.67 branch resolving, 0.3–0.4 long scoreboard (global), 0.2 not selected |
+| active threads per warp instruction | 12.8 of 32 (12.1 after predication) |
+| pipes, % of peak | ALU-heavy 40, LSU 34, ALU 24, ADU 10 |
+| L2 hit rate | 95–96%; DRAM 18–24% of peak; L1 hit 72–76% |
+| block limit | shared memory 2 blocks/SM; registers would allow 12 |
+
+Reading: the kernel is latency-bound with two warps per scheduler, every
+stall type is exposed, and only 40% of the lanes of an issued instruction
+do work (the pop / leaf / push paths of one loop iteration are executed one
+after another, each with its own lanes). Memory is not a limit at this n.
+The two ceilings are issue (ALU-heavy at 40% and LSU at 34% would saturate
+at about 2.5× the current issue rate) and divergence (up to 2.5× fewer
+warp instructions if lanes converged). More warps (frames out of shared
+memory) buys the first factor; shorter and fewer paths per step buy into
+the second.
+
+### 2.9 Register-resident search, byte frames, warp-cooperative ticket pool (2026-09-20)
+
+The stack design above (section 1) replaced the four-word shared-memory
+frames. Kernel time in seconds, even / odd side, sorted by configuration
+(`--prefix P --blocks-per-sm B`); the old kernel is the section 2.8 ladder.
+Counts correct in every run.
+
+| n | old kernel | new, per-lane ticket claiming (sweep 1) | new, warp pool (sweep 3) |
+|---|---|---|---|
+| 22 | p3 b2: 4.0 / 8.3 | p3 b2: 4.0 / 8.3; p4 b2: 6.2 / 8.7; p4 b4: 6.2 / 7.3; p4 b8: 6.9 / 9.1; p4 b12: 9.0 / 13.0; p5 b12: 17.0 / 21.4; p3 b4..b12: 8.6 / 20 … 18.7 / 37.5 | p3 b2: 4.6 / 10.7; p4 b2: 3.7 / 7.8; **p4 b4: 2.9 / 5.8**; p4 b8: 3.8 / 8.2; p4 b9: 4.6 / 10.4; p5 b4: 3.6 / 6.1; **p5 b9: 3.5 / 5.7** |
+| 23 | p4 b2: 66 / 37 | — | p5 b9 (default): 48 / 30 |
+| 24 | p4 b2: 120 / 261 | p4 b2: 119 / 257 | p4 b2: 117 / 264; p4 b4: 139 / 332; **p5 b4: 92 / 196**; p5 b8: 91 / 194; p5 b9: 95 / 203 |
+
+So: 1.3–1.4× at n = 23 and 24 (78 s and 291 s against 104 s and 383 s), and
+1.35× at n = 22 with the right prefix. Three effects were disentangled on
+the way:
+
+- **The register design itself is free.** At the old residency and prefix,
+  both versions of the new kernel time the old one to within 2%.
+- **Prefix depth sets an L2 cliff that moves with residency.** More
+  threads in flight span more items; once their tables exceed roughly
+  15–30 MB the table atomics become DRAM read-modify-writes (profile:
+  DRAM 29% of peak at p4 b9 against 4.8% at p5 b9, `lg_throttle` 2.1 vs
+  0.5 cycles). This is why prefix 3 collapses above 2 blocks per SM, prefix
+  4 above 4, and why n = 24 needs prefix 5 to use more than 2 blocks. The
+  rule in `plan::default_prefix_depth` now uses window factor 3 and a
+  quarter of L2, which reproduces every fast/slow point measured here. Note
+  the odd-square search of an odd n has fewer tickets per item (mirror), so
+  its window is wider: at n = 25 (old kernel, prefix 4) the odd side ran at
+  1.2 × 10¹¹ steps/s against 1.8 on the even side. A per-colour depth would
+  fix that.
+- **Per-lane ticket setup does not scale.** With one ticket claimed per
+  lane, prefix 4 cost the even side +2.2 s at every residency (sweep 1),
+  far more than its instruction count: the setup path (item search, five
+  digits with two integer divisions each, dead check) ran for one lane
+  while 31 waited, in most iterations. The warp-cooperative pool removed
+  that (p4 b2: 6.2 → 3.7 s) and also divides the counter atomics by 32.
+
+Profile of the first even launch at n = 22 (`--table-mem 4096`), old p3 b2
+against new p4 b9 and p5 b9: warps per SM 7.9 → 35.5; issue slots busy
+38.6% → 48%; eligible warps per scheduler 0.47 → 1.5 / 1.2; cycles per
+issued instruction 5.0 → 18.4; active threads per warp instruction 12.8 →
+13.0 / 13.7 (divergence unchanged); executed instructions 2.66 → 3.12 /
+3.76 × 10¹⁰ (the dead-ticket decode: +17% at p4, +41% at p5); SM clock
+2.87 → 2.56 GHz under the profiler, and 2808 → 2747 MHz mean in the sweeps
+at 504 W mean, 580 W peak, i.e. at the power limit. Top stalls of the new
+kernel: `mio_throttle` 3.7 / 1.9 (the per-iteration vote and the shared
+pool), `long_scoreboard` 2.8 / 7.5 (global loads in refill and pickup),
+`short_scoreboard` 2.4, `not_selected` 2.0 / 1.5, `math_pipe_throttle`
+1.4 / 1.0 (ALU-heavy at 52% of peak). ALU is now the busiest pipe and the
+GPU is near its power cap, so further gains must come from fewer
+instructions per step, not more warps: constant-divisor digit decode (the
+radices are compile-time constants), pool slots that carry the item's
+rows, stride and table offset (no global loads at pickup), voting every
+few iterations instead of every one, and then the leaf's `table_index`
+(item 3 of section 5).
+
+Instrumentation lesson: two sweeps' worth of timings were silently
+contaminated by stray processes because `pkill -f` matched the ssh shell
+that issued it; `pgrep -af "pnq[u]eens"` before every timing run.
 
 ## 3. Things that did not work (keep for reviewers)
 

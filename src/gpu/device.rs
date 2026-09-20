@@ -8,7 +8,9 @@ use super::plan::{
 use super::GpuOptions;
 use crate::solution_table::{RANK_HI, RANK_LO};
 use crate::RowCombo;
-use cudarc::driver::sys::CUdevice_attribute::{CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT};
+use cudarc::driver::sys::CUdevice_attribute::{
+    CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+};
 use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, LaunchAsync, LaunchConfig};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use std::sync::Arc;
@@ -24,34 +26,35 @@ const JOIN_KERNEL: &str = "join_kernel";
 /// Threads per block and table entries per block of the join kernel.
 const JOIN_THREADS: u32 = 256;
 const JOIN_CHUNK: u32 = JOIN_THREADS * 64;
-/// Static shared memory available to one block on every supported GPU.
-const SHARED_MEMORY_LIMIT: u32 = 48 * 1024;
-/// Bytes of shared memory per stack frame per thread (four u32 words).
-const FRAME_BYTES: u32 = 16;
-/// The residency the enumerate kernel typically gets, in threads per
-/// multiprocessor (eight warps); what the prefix-depth rule assumes.
-const RESIDENT_THREADS_PER_SM: u32 = 256;
+/// Threads per block of the enumerate kernel.
+const BLOCK: u32 = 128;
+/// Bytes of shared memory per stack frame per thread (the column placed).
+const FRAME_BYTES: u32 = 1;
 
-/// Threads per block and stack frames per thread for the enumerate kernel.
-/// A row set has at most n rows, and the DFS below the prefix needs one
-/// frame per row after it, so n - prefix frames always suffice. Blocks are
-/// 128 threads when their stacks fit the static shared-memory limit, else 64.
-fn block_shape(n: u32, prefix_depth: u32) -> (u32, u32) {
-    let frames = n.saturating_sub(prefix_depth).max(1);
-    let block = if 128 * frames * FRAME_BYTES <= SHARED_MEMORY_LIMIT { 128 } else { 64 };
-    (block, frames)
+/// Stack frames per thread for the enumerate kernel: a row set has at most
+/// n rows, the DFS below the prefix places one row per frame, and the last
+/// row never pushes a frame, so n - prefix - 1 frames always suffice.
+fn frames(n: u32, prefix_depth: u32) -> u32 {
+    (n.saturating_sub(prefix_depth + 1)).max(1)
 }
 
 /// Number of blocks to launch, and how many of them are resident on each
 /// multiprocessor: the kernel's threads are persistent (each loops over
 /// tickets), so we launch exactly the blocks that can be resident at once,
-/// as reported by the driver for this compiled kernel and block size.
-fn grid_size(dev: &CudaDevice, kernel: &CudaFunction, block_size: u32) -> Result<(u32, u32), String> {
+/// as reported by the driver for this compiled kernel and block size, or
+/// fewer if `cap` says so (to measure how throughput depends on residency).
+fn grid_size(dev: &CudaDevice, kernel: &CudaFunction, block_size: u32, cap: Option<u32>) -> Result<(u32, u32), String> {
     let sms = dev.attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT).map_err(cuda_err)? as u32;
-    let per_sm = kernel.occupancy_max_active_blocks_per_multiprocessor(block_size, 0, None).map_err(cuda_err)?;
-    if per_sm == 0 {
+    let max_per_sm = kernel.occupancy_max_active_blocks_per_multiprocessor(block_size, 0, None).map_err(cuda_err)?;
+    if max_per_sm == 0 {
         return Err("the kernel cannot be launched with this block size".into());
     }
+    let per_sm = match cap {
+        Some(0) => return Err("--blocks-per-sm must be at least 1".into()),
+        Some(cap) if cap > max_per_sm => return Err(format!("--blocks-per-sm {cap}: at most {max_per_sm} blocks fit a multiprocessor")),
+        Some(cap) => cap,
+        None => max_per_sm,
+    };
     Ok((sms * per_sm, per_sm))
 }
 
@@ -119,9 +122,13 @@ impl Gpu {
             (Some(depth), _) => depth,
             (None, None) => MIN_PREFIX_DEPTH,
             (None, Some(heaviest)) => {
+                // The residency the kernel will get: full unless capped. (The
+                // kernel's registers allow it; its shared memory is a byte per frame.)
                 let sms = dev.attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT).map_err(cuda_err)? as u32;
+                let max_threads = dev.attribute(CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR).map_err(cuda_err)? as u32;
+                let threads_per_sm = opts.blocks_per_sm.map_or(max_threads, |b| (b * BLOCK).min(max_threads));
                 let l2_bytes = dev.attribute(CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE).map_err(cuda_err)? as u64;
-                default_prefix_depth(n, heaviest, sms * RESIDENT_THREADS_PER_SM, l2_bytes)
+                default_prefix_depth(n, heaviest, sms * threads_per_sm, l2_bytes)
             }
         };
         if prefix_depth == 0 {
@@ -133,13 +140,13 @@ impl Gpu {
             return Err(format!("prefix depth {prefix_depth} gives up to {max_tickets} tickets per row set; the limit is 2^32"));
         }
 
-        let (block, frames) = block_shape(n, prefix_depth);
+        let (block, frames) = (BLOCK, frames(n, prefix_depth));
         let enumerate = load_kernel(&dev, enumerate_source(n, prefix_depth, block, frames), ENUMERATE_MODULE, ENUMERATE_KERNEL)?;
-        let (grid, blocks_per_sm) = grid_size(&dev, &enumerate, block)?;
+        let (grid, blocks_per_sm) = grid_size(&dev, &enumerate, block, opts.blocks_per_sm)?;
         println!(
-            "gpu: prefix depth {prefix_depth}, table budget {} MiB, {grid} blocks of {block} threads ({blocks_per_sm} per SM), {frames} stack frames ({} KiB shared memory per block)",
+            "gpu: prefix depth {prefix_depth}, table budget {} MiB, {grid} blocks of {block} threads ({blocks_per_sm} per SM), {frames} stack frames ({} bytes shared memory per block)",
             opts.table_budget_bytes >> 20,
-            block * frames * FRAME_BYTES / 1024
+            block * frames * FRAME_BYTES
         );
         let join = load_kernel(&dev, join_source(), JOIN_MODULE, JOIN_KERNEL)?;
 

@@ -134,6 +134,7 @@ fn count_queens_on_gpu(args: &Args, log: &mut RowsetLog) {
         device: args.device,
         prefix_depth: args.prefix_depth,
         table_budget_bytes: args.table_mem_mib << 20,
+        blocks_per_sm: args.blocks_per_sm,
     };
     gpu::count_queens_gpu(args.n, &opts, log).unwrap_or_else(|e| fail(&e));
 }
@@ -186,6 +187,8 @@ struct Args {
     prefix_depth: Option<u32>,
     /// Device memory for one batch's tables, in MiB (--table-mem).
     table_mem_mib: usize,
+    /// Resident blocks per multiprocessor (--blocks-per-sm); None means as many as fit.
+    blocks_per_sm: Option<u32>,
     /// Where to write the per-row-set counts (--out); None means rowsets_<n>.csv.
     out: Option<PathBuf>,
     /// `--sum FILE...`: re-tabulate from row-set files instead of counting.
@@ -197,20 +200,21 @@ fn parse_args() -> Args {
     let argv: Vec<String> = std::env::args().collect();
     let usage = || -> ! {
         eprintln!(
-            "usage: {0} <n> [--cuda] [--device I] [--prefix P] [--table-mem MiB] [--out FILE]\n\
+            "usage: {0} <n> [--cuda] [--device I] [--prefix P] [--table-mem MiB] [--blocks-per-sm B] [--out FILE]\n\
              \x20      {0} --sum FILE...\n\
              \x20 1 <= n <= 31\n\
              \x20 --cuda        Run on a CUDA GPU (build with --features cuda)\n\
              \x20 --device I    (CUDA mode only) CUDA device index (default 0)\n\
              \x20 --prefix P    (CUDA mode only) Rows fixed per GPU ticket (default: the least that keeps the tables in flight within L2)\n\
              \x20 --table-mem M (CUDA mode only) Device memory for tables per batch, MiB (default 8192)\n\
+             \x20 --blocks-per-sm B (CUDA mode only) Resident blocks per multiprocessor (default: as many as fit; fewer only for measurements)\n\
              \x20 --out FILE    Per-row-set counts, CSV (default rowsets_<n>.csv; never overwritten)\n\
              \x20 --sum FILE... Re-tabulate Q(n) from row-set files and check they are complete",
             argv.first().map_or("pnqueens", String::as_str)
         );
         std::process::exit(2);
     };
-    let mut args = Args { n: 0, cuda: false, device: 0, prefix_depth: None, table_mem_mib: 8192, out: None, sum_files: None };
+    let mut args = Args { n: 0, cuda: false, device: 0, prefix_depth: None, table_mem_mib: 8192, blocks_per_sm: None, out: None, sum_files: None };
     let mut n = None;
     let mut rest = argv.iter().skip(1);
     while let Some(arg) = rest.next() {
@@ -220,6 +224,7 @@ fn parse_args() -> Args {
             "--device" => args.device = value("--device").parse().unwrap_or_else(|_| usage()),
             "--prefix" => args.prefix_depth = Some(value("--prefix").parse().unwrap_or_else(|_| usage())),
             "--table-mem" => args.table_mem_mib = value("--table-mem").parse().unwrap_or_else(|_| usage()),
+            "--blocks-per-sm" => args.blocks_per_sm = Some(value("--blocks-per-sm").parse().unwrap_or_else(|_| usage())),
             "--out" => args.out = Some(PathBuf::from(value("--out"))),
             "--sum" => {
                 // Everything after --sum is a file name.

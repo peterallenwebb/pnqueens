@@ -27,22 +27,34 @@
  * the tickets [ticket_base[i], ticket_base[i + 1]).
  *
  * Threads are persistent and the kernel body is one loop, each iteration of
- * which either sets up a freshly claimed ticket or performs a single search
- * step of the ticket in progress. Tickets are claimed one at a time from a
- * shared counter, in order, so the tickets in progress at any moment are a
- * narrow window of consecutive tickets, i.e. of few items, and the tables
- * being updated stay within the L2 cache. (Claiming tickets in chunks widens
- * the window and was measured to be several times slower.) One loop for
- * every kind of work keeps the lanes of a warp executing together even
- * though tickets differ enormously in cost.
+ * which performs a single search step of the thread's ticket, or picks up a
+ * new ticket. Tickets are handed out in order from a global counter, so the
+ * tickets in progress at any moment are a narrow window of consecutive
+ * tickets, i.e. of few items, and the tables being updated stay within the
+ * L2 cache. (Letting each thread claim a run of tickets widens the window
+ * and was measured to be several times slower.)
  *
- * The DFS stack lives in shared memory: frame f of a thread is word
- * [f][threadIdx.x] of four arrays, so the threads of a warp touch
- * consecutive words. A frame holds the columns taken so far, the two
- * diagonal families shifted to the frame's row, and the columns of that row
- * still to try; the row itself is kept in a register and recomputed on
- * backing up. Shared memory per thread decides how many warps a
- * multiprocessor can hold, so frames are kept small.
+ * Ticket setup (finding the item, decoding the prefix, discarding dead
+ * tickets) is a long path, and most tickets are dead at the depths that
+ * keep the window narrow, so it must not run one lane at a time while the
+ * rest of the warp waits. Instead each warp keeps a pool of decoded
+ * prefixes: when the pool is empty and a lane needs work, the warp claims
+ * WARP consecutive tickets and every lane decodes one, together, keeping
+ * the live ones (`refill_pool`); a lane then takes a live prefix with a few
+ * shared-memory loads. The bookkeeping (which lanes need work, which pool
+ * slots are live) is done with warp votes at the top of every iteration, so
+ * it is uniform across the warp. One loop for every kind of work keeps the
+ * lanes executing together even though tickets differ enormously in cost.
+ *
+ * The search state lives in registers: the columns taken, the two diagonal
+ * families, the row being placed and the columns of it still to try. The
+ * diagonals are kept in board coordinates (see `diag1_bit`), which makes
+ * removing a queen the same XOR as placing it, so backing up recomputes the
+ * parent's state from the child's instead of reloading it; all a stack
+ * frame has to remember is the column it placed, one byte per frame per
+ * thread in shared memory. Shared memory per thread would otherwise decide
+ * how many warps a multiprocessor can hold; with byte frames the register
+ * count does.
  *
  * Mirror symmetry (NQ_MIRROR, set by the host for odd n): as in the CPU
  * `backtrack_odd_solutions`, the odd-square search places its first row's
@@ -52,7 +64,8 @@
  *
  * Baked in by the host at compile time: NQ_N (board size), NQ_PREFIX (prefix
  * depth), NQ_BLOCK (threads per block), NQ_FRAMES (stack frames per thread,
- * at least the largest row count minus NQ_PREFIX) and NQ_MIRROR (0 or 1).
+ * at least the largest row count minus NQ_PREFIX minus 1: the last row of a
+ * row set never pushes) and NQ_MIRROR (0 or 1).
  * kernel/emulate.cpp compiles this file as host C++ for the emulation test.
  */
 typedef unsigned int u32;
@@ -83,6 +96,22 @@ __device__ __forceinline__ u32 highest_set(u32 x) { return 31u - __clz(x); }  /*
  * parity, odd columns otherwise (`pmask` in the CPU enumerate). */
 __device__ __forceinline__ u32 row_columns(u32 r, u32 parity) {
     return ((r & 1u) == parity) ? EVEN_COLS : ODD_COLS;
+}
+
+/* ---- diagonals in board coordinates ----
+ *
+ * A queen at (r, c) lies on the / diagonal c - r and the \ diagonal c + r.
+ * The diagonals occupied by the queens placed so far are two 64-bit masks
+ * with bit c - r + (NQ_N - 1) set in the first and bit c + r in the second
+ * (2n - 1 diagonals each, so n <= 32 fits). The columns a family attacks
+ * in row r are then a shift of its mask, and a queen is placed or removed
+ * by the same XOR whatever the current row. */
+__device__ __forceinline__ u64 diag1_bit(u32 bit, u32 r) { return (u64)bit << (NQ_N - 1u - r); }
+__device__ __forceinline__ u64 diag2_bit(u32 bit, u32 r) { return (u64)bit << r; }
+
+/* Columns of row r attacked by the queens in `cols`, `d1`, `d2` (or taken). */
+__device__ __forceinline__ u32 attacked(u32 cols, u64 d1, u64 d2, u32 r) {
+    return cols | (u32)(d1 >> (NQ_N - 1u - r)) | (u32)(d2 >> r);
 }
 
 /* ---- table indexing, as in solution_table.rs ---- */
@@ -120,6 +149,11 @@ __device__ __forceinline__ u32 table_index(u32 cols, u32 parity, u32 odd_stride,
 
 /* ---- tickets ---- */
 
+#define WARP 32u
+#define FULL_WARP 0xffffffffu
+#define WARPS_PER_BLOCK ((NQ_BLOCK + WARP - 1u) / WARP)
+#define POOL ((NQ_BLOCK < WARP) ? NQ_BLOCK : WARP)   /* tickets claimed per refill: one per lane */
+
 /* The item owning ticket t, searched for forward from item `from`: tickets
  * are claimed in increasing order, so a thread's item never moves backwards
  * and is usually `from` itself or the next one. Gallops to bracket the
@@ -149,7 +183,8 @@ __device__ __forceinline__ u32 digit_radix(u32 col_parity, u32 parity, bool firs
 
 /* What a ticket's prefix fixes. */
 struct Prefix {
-    u32 cols, ld, rd;   /* columns taken, and the diagonals as seen from the first row still to place */
+    u32 cols;           /* columns taken by the prefix queens */
+    u64 d1, d2;         /* their diagonals */
     u32 rest;           /* rows still to place; 0: the prefix is the whole placement */
     u32 weight;         /* placements each leaf below stands for (mirror symmetry) */
     bool dead;          /* two prefix queens attack each other: nothing to count */
@@ -158,7 +193,7 @@ struct Prefix {
 /* Decodes ticket `local` of an item with row set `rows`: the columns of its
  * first min(NQ_PREFIX, |rows|) rows, placed as the CPU search would. */
 __device__ __forceinline__ Prefix decode_prefix(u32 local, u32 rows, u32 parity) {
-    Prefix p = {0u, 0u, 0u, rows, 1u, false};
+    Prefix p = {0u, 0ull, 0ull, rows, 1u, false};
     const u32 l = __popc(rows);
     const u32 depth = (NQ_PREFIX < l) ? NQ_PREFIX : l;
     for (u32 d = 0; d < depth && !p.dead; ++d) {
@@ -170,32 +205,117 @@ __device__ __forceinline__ Prefix decode_prefix(u32 local, u32 rows, u32 parity)
         local /= radix;
         const u32 bit = 1u << c;
         if (NQ_MIRROR && d == 0u && parity == 1u) p.weight = (c == MID) ? 1u : 2u;
-        p.dead = ((p.cols | p.ld | p.rd) & bit) != 0u;
-        const u32 gap = (p.rest != 0u) ? lowest_set(p.rest) - r : 0u;   /* to the next row to place */
+        p.dead = (attacked(p.cols, p.d1, p.d2, r) & bit) != 0u;
         p.cols |= bit;
-        p.ld = (p.ld | bit) << gap;
-        p.rd = (p.rd | bit) >> gap;
+        p.d1 |= diag1_bit(bit, r);
+        p.d2 |= diag2_bit(bit, r);
     }
     return p;
 }
 
+/* ---- the pool of decoded prefixes ---- */
+
+/* Slot k of a warp's pool is filled by lane k at a refill. */
+__shared__ u32 pool_item[WARPS_PER_BLOCK][WARP];
+__shared__ u32 pool_cols[WARPS_PER_BLOCK][WARP];
+__shared__ u64 pool_d1[WARPS_PER_BLOCK][WARP];
+__shared__ u64 pool_d2[WARPS_PER_BLOCK][WARP];
+__shared__ u32 pool_rest[WARPS_PER_BLOCK][WARP];
+__shared__ u32 pool_weight[WARPS_PER_BLOCK][WARP];
+
+/* Per-thread statistics, added to `counters` when the block is done. */
+struct Stats {
+    u32 tickets, dead;
+    u64 steps, leaves;
+
+    __device__ __forceinline__ void flush(u64* counters) const {
+        atomicAdd(counters + TICKETS, (u64)tickets);
+        atomicAdd(counters + DEAD, (u64)dead);
+        atomicAdd(counters + STEPS, steps);
+        atomicAdd(counters + LEAVES, leaves);
+    }
+};
+
+/* Refills the calling warp's pool, all lanes together: lane 0 claims POOL
+ * consecutive tickets, lane k decodes ticket k of them, and the prefixes
+ * that have a search below them go into the pool. Prefixes that are the
+ * whole placement are tallied here. Returns the mask of live pool slots,
+ * or sets `exhausted` when the claimed tickets are past the end of the
+ * work. `item` is the lane's last item, the starting point of the search
+ * for the ticket's item. */
+__device__ __forceinline__ u32 refill_pool(
+    u64* counter, u64 total, u32 lane, u32 warp, u32 parity, u32& item, bool& exhausted, Stats& stats,
+    const u32* item_rows, const u64* item_table, const u32* item_odd_stride, const u64* ticket_base, u32 n_items,
+    u32* tables, const u16* rank_lo, const u16* rank_hi)
+{
+    u64 base = 0;
+    if (lane == 0u) base = atomicAdd(counter, (u64)POOL);
+    base = __shfl_sync(FULL_WARP, base, 0);
+    exhausted = base >= total;
+    const u64 t = base + lane;
+    bool live = false;
+    if (t < total && lane < POOL) {
+        ++stats.tickets;
+        item = find_item(ticket_base, n_items, item, t);
+        const Prefix p = decode_prefix((u32)(t - ticket_base[item]), item_rows[item], parity);
+        if (p.dead) {
+            ++stats.dead;
+        } else if (p.rest == 0u) {             /* the prefix is the whole placement (also |R| = 0) */
+            atomicAdd(tables + item_table[item] + table_index(p.cols, parity, item_odd_stride[item], rank_lo, rank_hi), p.weight);
+            ++stats.leaves;
+        } else {
+            pool_item[warp][lane] = item;
+            pool_cols[warp][lane] = p.cols;
+            pool_d1[warp][lane] = p.d1;
+            pool_d2[warp][lane] = p.d2;
+            pool_rest[warp][lane] = p.rest;
+            pool_weight[warp][lane] = p.weight;
+            live = true;
+        }
+    }
+    return __ballot_sync(FULL_WARP, live);
+}
+
 /* ---- the search ---- */
 
-/* The DFS stack: frame f of the calling thread is word [f][threadIdx.x]. */
-__shared__ u32 st_cols[NQ_FRAMES][NQ_BLOCK];   /* columns taken by the rows above */
-__shared__ u32 st_ld[NQ_FRAMES][NQ_BLOCK];     /* columns attacked along / diagonals, at this row */
-__shared__ u32 st_rd[NQ_FRAMES][NQ_BLOCK];     /* columns attacked along \ diagonals, at this row */
-__shared__ u32 st_free[NQ_FRAMES][NQ_BLOCK];   /* columns of this row still to try */
+/* The DFS stack: the column placed by frame f of the calling thread, at
+ * byte [f][threadIdx.x]. Only frames below the top have placed a column. */
+__shared__ unsigned char st_col[NQ_FRAMES][NQ_BLOCK];
 
-/* Writes frame f for `row`, given the columns taken and the diagonals as
- * seen from that row; every colour-compatible column not attacked is free. */
-__device__ __forceinline__ void push_frame(int f, u32 row, u32 parity, u32 cols, u32 ld, u32 rd) {
-    const u32 tid = threadIdx.x;
-    st_cols[f][tid] = cols;
-    st_ld[f][tid] = ld;
-    st_rd[f][tid] = rd;
-    st_free[f][tid] = row_columns(row, parity) & ~(cols | ld | rd);
-}
+/* The search below a ticket's prefix. The queens placed so far, by the
+ * prefix and by the frames below the top, are in `cols`, `d1` and `d2`;
+ * the top frame is trying the columns of `row` still in `free`, lowest
+ * first. Backing up to a frame removes its queen by XOR and recomputes the
+ * columns it has still to try: the free ones above the one it placed. */
+struct Search {
+    u32 cols;
+    u64 d1, d2;
+    u32 row;            /* the row the top frame places */
+    u32 free;           /* columns of `row` still to try */
+
+    /* Moves to row r: every colour-compatible column not attacked is free. */
+    __device__ __forceinline__ void enter(u32 r, u32 parity) {
+        row = r;
+        free = row_columns(r, parity) & ~attacked(cols, d1, d2, r);
+    }
+
+    /* Places a queen in column `bit` of `row` and moves on to `next_row`. */
+    __device__ __forceinline__ void push(u32 bit, u32 next_row, u32 parity) {
+        cols |= bit;
+        d1 |= diag1_bit(bit, row);
+        d2 |= diag2_bit(bit, row);
+        enter(next_row, parity);
+    }
+
+    /* Backs up to `prev_row`, whose queen was in column `bit`. */
+    __device__ __forceinline__ void pop(u32 bit, u32 prev_row, u32 parity) {
+        row = prev_row;
+        cols ^= bit;
+        d1 ^= diag1_bit(bit, row);
+        d2 ^= diag2_bit(bit, row);
+        free = row_columns(row, parity) & ~attacked(cols, d1, d2, row) & ~((bit << 1u) - 1u);
+    }
+};
 
 /* The item and weight of the ticket a thread is working on. */
 struct Ticket {
@@ -207,19 +327,6 @@ struct Ticket {
     /* Counts a complete placement with column set `cols`. */
     __device__ __forceinline__ void tally(u32 cols, u32 parity, const u16* rank_lo, const u16* rank_hi) const {
         atomicAdd(table + table_index(cols, parity, odd_stride, rank_lo, rank_hi), weight);
-    }
-};
-
-/* Per-thread statistics, added to `counters` when the thread runs out of tickets. */
-struct Stats {
-    u32 tickets, dead;
-    u64 steps, leaves;
-
-    __device__ __forceinline__ void flush(u64* counters) const {
-        atomicAdd(counters + TICKETS, (u64)tickets);
-        atomicAdd(counters + DEAD, (u64)dead);
-        atomicAdd(counters + STEPS, steps);
-        atomicAdd(counters + LEAVES, leaves);
     }
 };
 
@@ -236,61 +343,69 @@ extern "C" __global__ void enumerate_kernel(
     u64* __restrict__ counters)                /* [N_COUNTERS] all zero at launch */
 {
     const u32 tid = threadIdx.x;
+    const u32 lane = tid % WARP, warp = tid / WARP;
+    const u32 lanes_below = (1u << lane) - 1u;
+    const u32 all_lanes = __ballot_sync(FULL_WARP, true);   /* the lanes that exist (the emulator has one) */
     const u64 total = ticket_base[n_items];
 
-    u32 item = 0;                              /* item of the current ticket; only ever increases */
+    u32 item = 0;                              /* the lane's last item; only ever increases */
     Ticket tk = {0u, 0u, tables, 1u};
     int f = -1;                                /* top frame of the search in progress; -1: none */
-    u32 row = 0;                               /* the row the top frame places */
+    Search s;
     Stats stats = {0u, 0u, 0ull, 0ull};
+    u32 live = 0;                              /* pool slots holding a prefix nobody has taken (warp-uniform) */
+    bool exhausted = false;                    /* the counter is past the end of the work (warp-uniform) */
 
     for (;;) {
-        if (f < 0) {
-            /* ---- claim the next ticket and set it up ---- */
-            const u64 t = atomicAdd(counters + NEXT_TICKET, 1ull);
-            if (t >= total) break;
-            ++stats.tickets;
-            item = find_item(ticket_base, n_items, item, t);
-            tk.rows = item_rows[item];
-            tk.odd_stride = item_odd_stride[item];
-            tk.table = tables + item_table[item];
-            const Prefix p = decode_prefix((u32)(t - ticket_base[item]), tk.rows, parity);
-            tk.weight = p.weight;
-            if (p.dead) {
-                ++stats.dead;
-            } else if (p.rest == 0u) {         /* the prefix is the whole placement (also |R| = 0) */
-                tk.tally(p.cols, parity, rank_lo, rank_hi);
-                ++stats.leaves;
-            } else {
-                row = lowest_set(p.rest);
-                f = 0;
-                push_frame(f, row, parity, p.cols, p.ld, p.rd);
+        /* ---- hand out work: warp-uniform bookkeeping, then the lanes that need it pick up ---- */
+        const u32 need = __ballot_sync(FULL_WARP, f < 0);
+        if (need != 0u) {
+            if (live == 0u && !exhausted) {
+                live = refill_pool(counters + NEXT_TICKET, total, lane, warp, parity, item, exhausted, stats,
+                                   item_rows, item_table, item_odd_stride, ticket_base, n_items, tables, rank_lo, rank_hi);
             }
-            continue;
+            if (live == 0u && exhausted && need == all_lanes) break;   /* nothing left for anyone */
+            const u32 n_live = (u32)__popc(live), n_need = (u32)__popc(need);
+            const u32 rank = (u32)__popc(need & lanes_below);       /* my place among the lanes that need work */
+            if (f < 0 && rank < n_live) {
+                const u32 slot = __fns(live, 0u, (int)rank + 1);    /* the rank-th live slot */
+                const u32 it = pool_item[warp][slot];
+                tk.rows = item_rows[it];
+                tk.odd_stride = item_odd_stride[it];
+                tk.table = tables + item_table[it];
+                tk.weight = pool_weight[warp][slot];
+                s.cols = pool_cols[warp][slot];
+                s.d1 = pool_d1[warp][slot];
+                s.d2 = pool_d2[warp][slot];
+                s.enter(lowest_set(pool_rest[warp][slot]), parity);
+                f = 0;
+            }
+            for (u32 taken = (n_need < n_live) ? n_need : n_live; taken > 0u; --taken) {
+                live &= live - 1u;                                  /* the lowest slots were taken */
+            }
+            if (f < 0) continue;                                    /* still nothing to do: wait for the next refill */
         }
 
         /* ---- one search step, as in the CPU enumerate ---- */
         ++stats.steps;
-        const u32 free = st_free[f][tid];
-        if (free == 0u) {                      /* the row is exhausted: back up */
-            if (--f >= 0) row = highest_set(tk.rows & ((1u << row) - 1u));   /* the previous row of R */
+        if (s.free == 0u) {                    /* the row is exhausted: back up */
+            if (--f >= 0) {
+                const u32 bit = 1u << st_col[f][tid];
+                s.pop(bit, highest_set(tk.rows & ((1u << s.row) - 1u)), parity);   /* to the previous row of R */
+            }
             continue;
         }
-        const u32 bit = lowest_bit(free);      /* try the lowest remaining column */
-        st_free[f][tid] = free ^ bit;
-        const u32 cols = st_cols[f][tid] | bit;
-        const u32 later = tk.rows >> (row + 1u);   /* rows of R after this one */
+        const u32 bit = lowest_bit(s.free);    /* try the lowest remaining column */
+        s.free ^= bit;
+        const u32 later = tk.rows >> (s.row + 1u);   /* rows of R after this one */
         if (later == 0u) {                     /* the last row: a complete placement */
-            tk.tally(cols, parity, rank_lo, rank_hi);
+            tk.tally(s.cols | bit, parity, rank_lo, rank_hi);
             ++stats.leaves;
             continue;
         }
-        const u32 gap = __ffs(later);          /* distance to the next row of R */
-        const u32 ld = (st_ld[f][tid] | bit) << gap;
-        const u32 rd = (st_rd[f][tid] | bit) >> gap;
+        st_col[f][tid] = (unsigned char)lowest_set(bit);
         ++f;
-        row += gap;
-        push_frame(f, row, parity, cols, ld, rd);
+        s.push(bit, s.row + __ffs(later), parity);   /* __ffs(later): distance to the next row of R */
     }
     stats.flush(counters);
 }
