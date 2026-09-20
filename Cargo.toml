@@ -11,6 +11,12 @@ rayon = "1.12.0"
 # the machine that runs `--cuda` needs the NVIDIA driver and libnvrtc.
 cudarc = { version = "0.12", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "cuda-12060"] }
 
+[build-dependencies]
+# Compiles the enumerate kernel as host C++ for `cargo test --features emulate`.
+cc = { version = "1", optional = true }
+
 [features]
 default = []
 cuda = ["dep:cudarc"]
+# Kernel emulation test: runs kernel/enumerate.cu as host C++ (needs a C++ compiler, no GPU).
+emulate = ["dep:cc"]

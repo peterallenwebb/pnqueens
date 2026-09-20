@@ -62,7 +62,7 @@
 //! each placement twice, plus the centre column, counted once. See
 //! `backtrack_odd_solutions` and `mirror_columns`.
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 mod gpu;
 mod rowset_log;
 mod solution_table;
