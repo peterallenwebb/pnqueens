@@ -4,7 +4,7 @@
 //! search and table indexing, and their agreement with `plan`, against the
 //! known counts without a GPU. Timing and residency need the real thing.
 
-use super::plan::{table_entries, uses_mirror, work_items, Batches, COUNTER_LEAVES, COUNTER_TICKETS, N_COUNTERS};
+use super::plan::{table_entries, table_words, uses_mirror, work_items, Batches, COUNTER_LEAVES, COUNTER_TALLIED, COUNTER_TICKETS, N_COUNTERS};
 use crate::solution_table::{RANK_HI, RANK_LO};
 use crate::KNOWN;
 
@@ -32,11 +32,11 @@ unsafe extern "C" {
 /// `batch_tables` heaviest tables' worth of memory.
 fn count_by_emulation(n: u32, prefix_depth: u32, batch_tables: usize) -> u128 {
     let items = work_items(n);
-    let budget = batch_tables * table_entries(n, items[0].mask);
+    let budget = batch_tables * table_words(table_entries(n, items[0].mask));
     let rank_hi_flat: Vec<u16> = RANK_HI.iter().flatten().copied().collect();
     let mut total: u128 = 0;
     for batch in Batches::new(n, &items, prefix_depth, budget).unwrap() {
-        let mut tables = [vec![0u32; batch.used_entries.max(1)], vec![0u32; batch.used_entries.max(1)]];
+        let mut tables = [vec![0u32; batch.used_words.max(1)], vec![0u32; batch.used_words.max(1)]];
         for (parity, launch) in batch.launches.iter().enumerate() {
             let mut counters = [0u64; N_COUNTERS];
             unsafe {
@@ -57,16 +57,22 @@ fn count_by_emulation(n: u32, prefix_depth: u32, batch_tables: usize) -> u128 {
                 );
             }
             assert_eq!(counters[COUNTER_TICKETS], launch.tickets(), "every ticket is taken exactly once");
-            let tallied: u64 = tables[parity].iter().map(|&c| u64::from(c)).sum();
-            assert!(tallied >= counters[COUNTER_LEAVES], "every leaf is tallied (with its weight)");
+            // The tables hold the tallied weights, as the join's check on the GPU requires.
+            let in_tables: u64 = tables[parity].iter().map(|&w| u64::from(w & 0xFFFF) + u64::from(w >> 16)).sum();
+            assert_eq!(in_tables, counters[COUNTER_TALLIED], "every tallied weight is in the tables");
+            assert!(in_tables >= counters[COUNTER_LEAVES], "every leaf is tallied");
         }
-        // The join.
+        // The join, over packed 16-bit entries.
         for (i, item) in batch.items.iter().enumerate() {
             let offset = batch.launches[0].table_offset[i] as usize;
-            let len = batch.entries[i] as usize;
+            let len = batch.words[i] as usize;
             let e = &tables[0][offset..offset + len];
             let o = &tables[1][offset..offset + len];
-            let count: u64 = e.iter().zip(o).map(|(&e, &o)| u64::from(e) * u64::from(o)).sum();
+            let count: u64 = e
+                .iter()
+                .zip(o)
+                .map(|(&e, &o)| u64::from(e & 0xFFFF) * u64::from(o & 0xFFFF) + u64::from(e >> 16) * u64::from(o >> 16))
+                .sum();
             total += u128::from(item.weight as u32) * u128::from(count);
         }
     }

@@ -30,7 +30,13 @@ Same decomposition as the CPU path. For each feasible even-queen row set R
 Tables are dense arrays indexed by the colex rank of the column set, exactly
 as `SolutionTable` does on the CPU (split the mask into even/odd column
 masks, rank each with the two-level `RANK_LO`/`RANK_HI` tables,
-`index = rank(even) * odd_stride + rank(odd)`).
+`index = rank(even) * odd_stride + rank(odd)`). On the GPU the entries are
+16 bits, two per 32-bit word, tallied with one 32-bit atomic of the weight
+shifted into place (2.10); the join sums the entries of each colour and the
+host requires the sums to equal the weights the searches tallied, which an
+overflowed entry (a carry into its neighbour) would break. Largest entries
+seen: 291 at n = 22, 982 at n = 24, 2,224 at n = 25 (odd tables carry the
+mirror weight 2); the reference project saw 3,662 unweighted at n = 28.
 
 ### Kernels
 
@@ -325,6 +331,40 @@ few iterations instead of every one, and then the leaf's `table_index`
 Instrumentation lesson: two sweeps' worth of timings were silently
 contaminated by stray processes because `pkill -f` matched the ssh shell
 that issued it; `pgrep -af "pnq[u]eens"` before every timing run.
+
+### 2.10 Packed 16-bit tables and instruction cuts (2026-09-20, container box)
+
+Changes: table entries packed two to a word (halving the tables in flight);
+ticket digits decoded with literal divisors (a multiply and a shift instead
+of a runtime division); pool slots carrying the item's rows, stride and
+table offset (a pickup touches no global memory); the diagonal shifts as
+funnel shifts (one instruction each, the shift is always below 32); and the
+handout vote every fourth iteration. The kernel now takes 68 registers,
+which fits 8 blocks per SM; `__launch_bounds__(128, 9)` brings it to 54
+registers without spilling, but the ninth block does not pay for the
+tighter allocation (n = 22: 3.00 / 6.04 s bounded against 2.85 / 5.74
+unbounded), so the bound is applied only when `--blocks-per-sm` asks for a
+residency. Kernel seconds, even / odd, at the defaults the recalibrated
+rule now picks (prefix 4 at n = 22, 5 at 23–26):
+
+| n | old kernel | 2.9 (best config) | now (defaults) | now vs old |
+|---|---|---|---|---|
+| 22 | 4.0 / 8.3 | 2.9 / 5.8 | 2.85 / 5.74 | 1.45× |
+| 23 | 66 / 37 | 48 / 30 | 47 / 25.5 | 1.42× |
+| 24 | 120 / 261 | 92 / 196 | 89.5 / 192 | 1.35× |
+| 25 | 2,145 / 1,787 | — | 1,695 / 940 | 1.49× |
+
+The packing did what it was for: prefix 4 at full residency no longer falls
+off the L2 cliff at n = 22 (2.85 / 5.74 against 4.65 / 10.4 in 2.9), and the
+odd side of n = 25, which the old kernel ran at 1.2 × 10¹¹ steps/s because
+the mirror leaves it a wider ticket window, now runs at 2.3 × 10¹¹ like the
+even side. The instruction cuts themselves bought only 2–3% at n = 24, where
+dead-ticket decoding was a small share to begin with. The rate is now
+2.3–2.6 × 10¹¹ steps/s on both colours at every n from 22 to 25, so the
+remaining limiters are what the 2.9 profile showed apart from decoding:
+divergence (13 of 32 lanes active per instruction), the leaf's
+`table_index`, and the power limit. (No profiler on this container box:
+ERR_NVGPUCTRPERM, as in the earlier ones.)
 
 ## 3. Things that did not work (keep for reviewers)
 

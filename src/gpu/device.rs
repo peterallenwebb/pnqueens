@@ -2,8 +2,8 @@
 //! buffers, and runs the plan one batch at a time.
 
 use super::plan::{
-    default_prefix_depth, uses_mirror, Batch, Launch, COUNTER_DEAD, COUNTER_LEAVES, COUNTER_STEPS, COUNTER_TICKETS, ENTRY_BYTES,
-    MIN_PREFIX_DEPTH, N_COUNTERS,
+    default_prefix_depth, uses_mirror, Batch, Launch, COUNTER_DEAD, COUNTER_LEAVES, COUNTER_STEPS, COUNTER_TALLIED, COUNTER_TICKETS,
+    MIN_PREFIX_DEPTH, N_COUNTERS, WORD_BYTES,
 };
 use super::GpuOptions;
 use crate::solution_table::{RANK_HI, RANK_LO};
@@ -23,7 +23,7 @@ const JOIN_SRC: &str = include_str!("../../kernel/join.cu");
 const JOIN_MODULE: &str = "pnqueens_join";
 const JOIN_KERNEL: &str = "join_kernel";
 
-/// Threads per block and table entries per block of the join kernel.
+/// Threads per block and table words per block of the join kernel.
 const JOIN_THREADS: u32 = 256;
 const JOIN_CHUNK: u32 = JOIN_THREADS * 64;
 /// Threads per block of the enumerate kernel.
@@ -60,9 +60,9 @@ fn grid_size(dev: &CudaDevice, kernel: &CudaFunction, block_size: u32, cap: Opti
 
 /// The enumerate kernel source for this run: the board and launch shape are
 /// compile-time constants of the kernel.
-fn enumerate_source(n: u32, prefix_depth: u32, block: u32, frames: u32) -> String {
+fn enumerate_source(n: u32, prefix_depth: u32, block: u32, min_blocks: u32, frames: u32) -> String {
     format!(
-        "#define NQ_N {n}u\n#define NQ_PREFIX {prefix_depth}u\n#define NQ_BLOCK {block}u\n#define NQ_FRAMES {frames}u\n#define NQ_MIRROR {}\n{ENUMERATE_SRC}",
+        "#define NQ_N {n}u\n#define NQ_PREFIX {prefix_depth}u\n#define NQ_BLOCK {block}u\n#define NQ_MIN_BLOCKS {min_blocks}u\n#define NQ_FRAMES {frames}u\n#define NQ_MIRROR {}\n{ENUMERATE_SRC}",
         u32::from(uses_mirror(n))
     )
 }
@@ -96,10 +96,13 @@ pub struct Gpu {
     rank_hi: CudaSlice<u16>,
     /// One buffer of tables per colour: parity 0 fills the first, parity 1 the second.
     tables: [CudaSlice<u32>; 2],
-    /// Entries in each table buffer.
-    budget_entries: usize,
+    /// Words in each table buffer.
+    budget_words: usize,
     /// The enumerate kernel's ticket counter and statistics (see N_COUNTERS).
     counters: CudaSlice<u64>,
+    /// The join's sums of all E and all O entries, and the largest entry.
+    entry_sums: CudaSlice<u64>,
+    max_entry: CudaSlice<u32>,
 }
 
 /// What one batch produced.
@@ -109,6 +112,8 @@ pub struct BatchResult {
     /// Statistics of the two enumerate launches.
     pub stats: [LaunchStats; 2],
     pub join_seconds: f64,
+    /// The largest table entry of the batch (the entries are 16 bits).
+    pub max_entry: u32,
 }
 
 impl Gpu {
@@ -141,7 +146,11 @@ impl Gpu {
         }
 
         let (block, frames) = (BLOCK, frames(n, prefix_depth));
-        let enumerate = load_kernel(&dev, enumerate_source(n, prefix_depth, block, frames), ENUMERATE_MODULE, ENUMERATE_KERNEL)?;
+        // The register allocation is left alone unless a residency was asked
+        // for: 8 unconstrained blocks measured faster than 9 constrained ones.
+        let min_blocks = opts.blocks_per_sm.unwrap_or(0);
+        let enumerate =
+            load_kernel(&dev, enumerate_source(n, prefix_depth, block, min_blocks, frames), ENUMERATE_MODULE, ENUMERATE_KERNEL)?;
         let (grid, blocks_per_sm) = grid_size(&dev, &enumerate, block, opts.blocks_per_sm)?;
         println!(
             "gpu: prefix depth {prefix_depth}, table budget {} MiB, {grid} blocks of {block} threads ({blocks_per_sm} per SM), {frames} stack frames ({} bytes shared memory per block)",
@@ -154,19 +163,21 @@ impl Gpu {
         let rank_hi_flat: Vec<u16> = RANK_HI.iter().flatten().copied().collect();
         let rank_hi = dev.htod_sync_copy(&rank_hi_flat).map_err(cuda_err)?;
         // Half the budget for each colour's tables.
-        let budget_entries = opts.table_budget_bytes / ENTRY_BYTES / 2;
-        let tables = [dev.alloc_zeros(budget_entries).map_err(cuda_err)?, dev.alloc_zeros(budget_entries).map_err(cuda_err)?];
+        let budget_words = opts.table_budget_bytes / WORD_BYTES / 2;
+        let tables = [dev.alloc_zeros(budget_words).map_err(cuda_err)?, dev.alloc_zeros(budget_words).map_err(cuda_err)?];
         let counters = dev.alloc_zeros(N_COUNTERS).map_err(cuda_err)?;
-        Ok(Gpu { dev, enumerate, join, grid, block, prefix_depth, rank_lo, rank_hi, tables, budget_entries, counters })
+        let entry_sums = dev.alloc_zeros(2).map_err(cuda_err)?;
+        let max_entry = dev.alloc_zeros(1).map_err(cuda_err)?;
+        Ok(Gpu { dev, enumerate, join, grid, block, prefix_depth, rank_lo, rank_hi, tables, budget_words, counters, entry_sums, max_entry })
     }
 
     pub fn prefix_depth(&self) -> u32 {
         self.prefix_depth
     }
 
-    /// Table memory available per colour, in entries.
-    pub fn budget_entries(&self) -> usize {
-        self.budget_entries
+    /// Table memory available per colour, in words.
+    pub fn budget_words(&self) -> usize {
+        self.budget_words
     }
 
     /// Runs the three launches of a batch: the even-square search of every
@@ -174,12 +185,22 @@ impl Gpu {
     /// stream, so each sees the tables the previous one completed.
     pub fn run_batch(&mut self, batch: &Batch) -> Result<BatchResult, String> {
         for tables in self.tables.iter_mut() {
-            let mut used = tables.slice_mut(0..batch.used_entries.max(1));
+            let mut used = tables.slice_mut(0..batch.used_words.max(1));
             self.dev.memset_zeros(&mut used).map_err(cuda_err)?;
         }
         let stats = [self.enumerate(0, &batch.launches[0])?, self.enumerate(1, &batch.launches[1])?];
-        let (counts, join_seconds) = self.join(batch)?;
-        Ok(BatchResult { counts, stats, join_seconds })
+        let (counts, entry_sums, max_entry, join_seconds) = self.join(batch)?;
+        // Every weight the searches tallied must be in the tables: an entry
+        // that overflowed its 16 bits would have carried into its neighbour.
+        for (colour, (tallied, in_tables)) in ["even", "odd"].iter().zip(stats.iter().map(|s| s.tallied).zip(entry_sums)) {
+            if tallied != in_tables {
+                return Err(format!(
+                    "{colour}-square tables of batch at item {} hold {in_tables} but {tallied} were tallied: a table entry overflowed (largest seen {max_entry})",
+                    batch.first
+                ));
+            }
+        }
+        Ok(BatchResult { counts, stats, join_seconds, max_entry })
     }
 
     /// One enumerate launch, timed, with its kernel counters collected.
@@ -214,21 +235,27 @@ impl Gpu {
     }
 
     /// The join of a batch: one grid column per item, enough chunks for the
-    /// longest table. Returns the per-item counts and the time taken.
-    fn join(&mut self, batch: &Batch) -> Result<(Vec<u64>, f64), String> {
+    /// longest table. Returns the per-item counts, the sums of all E and all
+    /// O entries, the largest entry, and the time taken.
+    fn join(&mut self, batch: &Batch) -> Result<(Vec<u64>, [u64; 2], u32, f64), String> {
         let start = Instant::now();
         let dev = &self.dev;
         let n_items = batch.items.len();
         let table_offset = dev.htod_sync_copy(&batch.launches[0].table_offset).map_err(cuda_err)?;
-        let entries = dev.htod_sync_copy(&batch.entries).map_err(cuda_err)?;
+        let words = dev.htod_sync_copy(&batch.words).map_err(cuda_err)?;
         let mut sums: CudaSlice<u64> = dev.alloc_zeros(n_items).map_err(cuda_err)?;
-        let chunks = batch.entries.iter().max().copied().unwrap_or(0).div_ceil(JOIN_CHUNK).max(1);
+        dev.memset_zeros(&mut self.entry_sums).map_err(cuda_err)?;
+        dev.memset_zeros(&mut self.max_entry).map_err(cuda_err)?;
+        let chunks = batch.words.iter().max().copied().unwrap_or(0).div_ceil(JOIN_CHUNK).max(1);
         let cfg = LaunchConfig { grid_dim: (n_items as u32, chunks, 1), block_dim: (JOIN_THREADS, 1, 1), shared_mem_bytes: 0 };
         let [e_tables, o_tables] = &self.tables;
-        unsafe { self.join.clone().launch(cfg, (&table_offset, &entries, e_tables, o_tables, &mut sums)).map_err(cuda_err)? };
+        let params = (&table_offset, &words, e_tables, o_tables, &mut sums, &mut self.entry_sums, &mut self.max_entry);
+        unsafe { self.join.clone().launch(cfg, params).map_err(cuda_err)? };
         dev.synchronize().map_err(cuda_err)?;
         let counts = dev.dtoh_sync_copy(&sums).map_err(cuda_err)?;
-        Ok((counts, start.elapsed().as_secs_f64()))
+        let entry_sums = dev.dtoh_sync_copy(&self.entry_sums).map_err(cuda_err)?;
+        let max_entry = dev.dtoh_sync_copy(&self.max_entry).map_err(cuda_err)?;
+        Ok((counts, [entry_sums[0], entry_sums[1]], max_entry[0], start.elapsed().as_secs_f64()))
     }
 }
 
@@ -245,11 +272,20 @@ pub struct LaunchStats {
     pub steps: u64,
     /// Complete placements found.
     pub leaves: u64,
+    /// Sum of the weights added to the tables.
+    pub tallied: u64,
 }
 
 impl LaunchStats {
     fn from_counters(c: &[u64], seconds: f64) -> Self {
-        LaunchStats { seconds, tickets: c[COUNTER_TICKETS], dead: c[COUNTER_DEAD], steps: c[COUNTER_STEPS], leaves: c[COUNTER_LEAVES] }
+        LaunchStats {
+            seconds,
+            tickets: c[COUNTER_TICKETS],
+            dead: c[COUNTER_DEAD],
+            steps: c[COUNTER_STEPS],
+            leaves: c[COUNTER_LEAVES],
+            tallied: c[COUNTER_TALLIED],
+        }
     }
 
     pub fn add(&mut self, o: &LaunchStats) {
@@ -258,6 +294,7 @@ impl LaunchStats {
         self.dead += o.dead;
         self.steps += o.steps;
         self.leaves += o.leaves;
+        self.tallied += o.tallied;
     }
 }
 

@@ -8,8 +8,11 @@
 use crate::solution_table::SolutionTable;
 use crate::{complement, get_feasible_even_row_combos, RowCombo};
 
-/// Bytes of one table entry: the kernels tally and join in u32.
-pub const ENTRY_BYTES: usize = std::mem::size_of::<u32>();
+/// Table entries are 16 bits, packed two to a 32-bit word (the kernel
+/// tallies with 32-bit atomics of the weight shifted into place); offsets
+/// and lengths of tables are in words.
+pub const ENTRIES_PER_WORD: usize = 2;
+pub const WORD_BYTES: usize = std::mem::size_of::<u32>();
 
 /// Layout of the enumerate kernel's counter buffer: index 0 is the ticket
 /// counter the kernel claims work from, the rest are the statistics it adds
@@ -18,7 +21,9 @@ pub const COUNTER_TICKETS: usize = 1;
 pub const COUNTER_DEAD: usize = 2;
 pub const COUNTER_STEPS: usize = 3;
 pub const COUNTER_LEAVES: usize = 4;
-pub const N_COUNTERS: usize = 5;
+/// Sum of the weights added to the tables; the join checks the tables against it.
+pub const COUNTER_TALLIED: usize = 5;
+pub const N_COUNTERS: usize = 6;
 
 /// The smallest prefix depth worth using.
 pub const MIN_PREFIX_DEPTH: u32 = 3;
@@ -54,6 +59,11 @@ pub fn table_shape(n: u32, rows: u32) -> (usize, u32) {
 /// Entries in each table of the item with row set `rows`.
 pub fn table_entries(n: u32, rows: u32) -> usize {
     table_shape(n, rows).0
+}
+
+/// Words a table of `entries` entries occupies.
+pub fn table_words(entries: usize) -> usize {
+    entries.div_ceil(ENTRIES_PER_WORD)
 }
 
 /// Whether the kernel applies the mirror symmetry of `backtrack_odd_solutions`
@@ -105,7 +115,7 @@ pub fn ticket_count(n: u32, rows: u32, parity: u32, prefix_depth: u32) -> u64 {
 /// cost decoding work for their many more, mostly dead, tickets, so the
 /// depth is no larger than this needs. The heaviest item stands for all.
 pub fn default_prefix_depth(n: u32, heaviest: &RowCombo, threads: u32, l2_bytes: u64) -> u32 {
-    let table_bytes = (table_entries(n, heaviest.mask) * ENTRY_BYTES) as u64;
+    let table_bytes = (table_words(table_entries(n, heaviest.mask)) * WORD_BYTES) as u64;
     let window = TICKET_WINDOW_FACTOR * u64::from(threads);
     let rows_bar = complement(n, heaviest.mask);
     let mut depth = MIN_PREFIX_DEPTH;
@@ -127,7 +137,7 @@ pub fn default_prefix_depth(n: u32, heaviest: &RowCombo, threads: u32, l2_bytes:
 pub struct Launch {
     /// Row set of each item: R for the even-square search, R̅ for the odd-square one.
     pub rows: Vec<u32>,
-    /// Offset of each item's table in the colour's table buffer, in entries.
+    /// Offset of each item's table in the colour's table buffer, in words.
     pub table_offset: Vec<u64>,
     /// Odd stride of each item's table.
     pub odd_stride: Vec<u32>,
@@ -162,10 +172,10 @@ pub struct Batch<'a> {
     pub items: &'a [RowCombo],
     /// Per colour: [0] searches R on even squares, [1] searches R̅ on odd squares.
     pub launches: [Launch; 2],
-    /// Table length of each item, for the join.
-    pub entries: Vec<u32>,
-    /// Entries of table memory the batch uses, per colour.
-    pub used_entries: usize,
+    /// Table length of each item in words, for the join.
+    pub words: Vec<u32>,
+    /// Words of table memory the batch uses, per colour.
+    pub used_words: usize,
 }
 
 /// Cuts the sorted item list into batches that fit the table budget.
@@ -174,20 +184,20 @@ pub struct Batches<'a> {
     items: &'a [RowCombo],
     next: usize,
     prefix_depth: u32,
-    budget_entries: usize,
+    budget_words: usize,
 }
 
 impl<'a> Batches<'a> {
-    /// `budget_entries` is the table memory available per colour, in entries.
-    pub fn new(n: u32, items: &'a [RowCombo], prefix_depth: u32, budget_entries: usize) -> Result<Self, String> {
-        let heaviest = items.iter().map(|item| table_entries(n, item.mask)).max().unwrap_or(0);
-        if heaviest > budget_entries {
+    /// `budget_words` is the table memory available per colour, in words.
+    pub fn new(n: u32, items: &'a [RowCombo], prefix_depth: u32, budget_words: usize) -> Result<Self, String> {
+        let heaviest = items.iter().map(|item| table_words(table_entries(n, item.mask))).max().unwrap_or(0);
+        if heaviest > budget_words {
             return Err(format!(
-                "table budget of {} MiB is too small for one pair of tables of {heaviest} entries",
-                (2 * budget_entries * ENTRY_BYTES) >> 20
+                "table budget of {} MiB is too small for one pair of tables of {heaviest} words",
+                (2 * budget_words * WORD_BYTES) >> 20
             ));
         }
-        Ok(Batches { n, items, next: 0, prefix_depth, budget_entries })
+        Ok(Batches { n, items, next: 0, prefix_depth, budget_words })
     }
 }
 
@@ -200,21 +210,22 @@ impl<'a> Iterator for Batches<'a> {
         }
         let first = self.next;
         let mut launches = [Launch::new(), Launch::new()];
-        let mut entries = Vec::new();
+        let mut words = Vec::new();
         let mut used = 0;
         while let Some(item) = self.items.get(self.next) {
-            let (len, odd_stride) = table_shape(self.n, item.mask);
-            if used + len > self.budget_entries {
+            let (entries, odd_stride) = table_shape(self.n, item.mask);
+            let len = table_words(entries);
+            if used + len > self.budget_words {
                 break;
             }
             let rows_bar = complement(self.n, item.mask);
             launches[0].push(item.mask, used as u64, odd_stride, ticket_count(self.n, item.mask, 0, self.prefix_depth));
             launches[1].push(rows_bar, used as u64, odd_stride, ticket_count(self.n, rows_bar, 1, self.prefix_depth));
-            entries.push(len as u32);
+            words.push(len as u32);
             used += len;
             self.next += 1;
         }
-        Some(Batch { first, items: &self.items[first..self.next], launches, entries, used_entries: used })
+        Some(Batch { first, items: &self.items[first..self.next], launches, words, used_words: used })
     }
 }
 
@@ -249,7 +260,7 @@ mod tests {
     fn batches_cover_the_items_in_order_within_budget() {
         let n = 12;
         let items = work_items(n);
-        let heaviest = table_entries(n, items[0].mask);
+        let heaviest = table_words(table_entries(n, items[0].mask));
         let budget = 3 * heaviest;
         assert!(Batches::new(n, &items, 3, heaviest - 1).is_err(), "a budget below the heaviest table is refused");
 
@@ -257,8 +268,8 @@ mod tests {
         for batch in Batches::new(n, &items, 3, budget).unwrap() {
             assert_eq!(batch.first, seen);
             assert!(!batch.items.is_empty());
-            assert!(batch.used_entries <= budget);
-            assert_eq!(batch.entries.len(), batch.items.len());
+            assert!(batch.used_words <= budget);
+            assert_eq!(batch.words.len(), batch.items.len());
             for launch in &batch.launches {
                 assert_eq!(launch.rows.len(), batch.items.len());
                 assert_eq!(launch.ticket_base.len(), batch.items.len() + 1);
@@ -271,10 +282,10 @@ mod tests {
                 assert_eq!(batch.launches[1].table_offset[i], offset);
                 assert_eq!(batch.launches[0].rows[i], item.mask);
                 assert_eq!(batch.launches[1].rows[i], complement(n, item.mask));
-                assert_eq!(batch.entries[i] as usize, table_entries(n, item.mask));
-                offset += u64::from(batch.entries[i]);
+                assert_eq!(batch.words[i] as usize, table_words(table_entries(n, item.mask)));
+                offset += u64::from(batch.words[i]);
             }
-            assert_eq!(offset as usize, batch.used_entries);
+            assert_eq!(offset as usize, batch.used_words);
             seen += batch.items.len();
         }
         assert_eq!(seen, items.len());
@@ -282,12 +293,12 @@ mod tests {
 
     #[test]
     fn default_prefix_depth_on_a_5090() {
-        // 170 SMs at full residency (1536 threads per SM), 96 MB of L2. Depth 5
-        // from n = 22 (measured best at n = 22..24), 6 from n = 25 (the mirror
-        // leaves the odd-square search fewer tickets per item) and, from n = 28,
-        // because even one heaviest table in flight is more than the L2 share.
+        // 170 SMs at full residency (1536 threads per SM), 96 MB of L2, packed
+        // 16-bit entries. Depth 4 at n = 22, 5 from n = 23, 6 at n = 27 (the
+        // mirror leaves the odd-square search fewer tickets per item) and from
+        // n = 28, where even one heaviest table in flight is more than the L2 share.
         let l2 = 96 << 20;
-        for (n, depth) in [(20, 4), (22, 5), (23, 5), (24, 5), (25, 6), (26, 6), (27, 6), (28, 6), (29, 6)] {
+        for (n, depth) in [(20, 4), (22, 4), (23, 5), (24, 5), (25, 5), (26, 5), (27, 6), (28, 6), (29, 6)] {
             let items = work_items(n);
             assert_eq!(default_prefix_depth(n, &items[0], 170 * 1536, l2), depth, "n = {n}");
         }

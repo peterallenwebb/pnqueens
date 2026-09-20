@@ -68,10 +68,11 @@ pub fn count_queens_gpu(n: u32, opts: &GpuOptions, log: &mut crate::rowset_log::
     let items = plan::work_items(n);
     println!("PREPARED {}", items.len());
     let mut gpu = Gpu::new(n, opts, items.first())?;
-    let batches = plan::Batches::new(n, &items, gpu.prefix_depth(), gpu.budget_entries())?;
+    let batches = plan::Batches::new(n, &items, gpu.prefix_depth(), gpu.budget_words())?;
 
     let mut totals = [LaunchStats::default(), LaunchStats::default()]; // per colour, whole run
     let mut join_seconds = 0.0;
+    let mut max_entry = 0;
     for (number, batch) in batches.enumerate() {
         let result = gpu.run_batch(&batch)?;
         // Record the batch's row sets; the flush makes them durable before
@@ -85,13 +86,14 @@ pub fn count_queens_gpu(n: u32, opts: &GpuOptions, log: &mut crate::rowset_log::
             total.add(stats);
         }
         join_seconds += result.join_seconds;
+        max_entry = max_entry.max(result.max_entry);
         println!(
             "BATCH {}: items {}..{} of {}, 2 x {} MiB of tables; even {}; odd {}; join {:.3}s; {:.1}s elapsed",
             number + 1,
             batch.first,
             batch.first + batch.items.len(),
             items.len(),
-            (batch.used_entries * plan::ENTRY_BYTES) >> 20,
+            (batch.used_words * plan::WORD_BYTES) >> 20,
             result.stats[0],
             result.stats[1],
             result.join_seconds,
@@ -101,5 +103,6 @@ pub fn count_queens_gpu(n: u32, opts: &GpuOptions, log: &mut crate::rowset_log::
     println!("even total: {}", totals[0]);
     println!("odd total:  {}", totals[1]);
     println!("join total: {join_seconds:.3}s");
+    println!("largest table entry: {max_entry} (16-bit entries; every batch's tables matched the tallies)");
     Ok(())
 }

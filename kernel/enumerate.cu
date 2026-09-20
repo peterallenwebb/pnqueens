@@ -17,7 +17,10 @@
  * the random table reads a direct evaluation of the sum would need. Table
  * indexing is SolutionTable's (src/solution_table.rs): split the column mask
  * into dense even/odd masks, colex-rank each with the two-level rank tables,
- * index = rank(even) * odd_stride + rank(odd).
+ * index = rank(even) * odd_stride + rank(odd). Entries are 16 bits, two to a
+ * 32-bit word (entry i is half i % 2 of word i / 2), tallied with one 32-bit
+ * atomic of the weight shifted into place; the largest entry is a few
+ * thousand at n = 28, and the join checks the tables against the tallies.
  *
  * Work division. The work is cut into tickets. A ticket fixes the columns of
  * the first NQ_PREFIX rows of its item as a mixed-radix number, digit t
@@ -63,9 +66,14 @@
  * itself (weight 1). The first prefix digit ranges over just those columns.
  *
  * Baked in by the host at compile time: NQ_N (board size), NQ_PREFIX (prefix
- * depth), NQ_BLOCK (threads per block), NQ_FRAMES (stack frames per thread,
- * at least the largest row count minus NQ_PREFIX minus 1: the last row of a
- * row set never pushes) and NQ_MIRROR (0 or 1).
+ * depth), NQ_BLOCK (threads per block), NQ_MIN_BLOCKS (blocks per
+ * multiprocessor the register allocation must allow, 0 for no constraint:
+ * unconstrained the kernel takes 68 registers and 8 blocks fit, which
+ * measured slightly faster than 9 blocks in 54 registers), NQ_FRAMES
+ * (stack frames per thread, at least the largest row count minus NQ_PREFIX
+ * minus 1: the last row of a row set never pushes) and NQ_MIRROR (0 or 1).
+ * n <= 31: column masks are 32-bit and the diagonal shifts assume a row
+ * index below 32.
  * kernel/emulate.cpp compiles this file as host C++ for the emulation test.
  */
 typedef unsigned int u32;
@@ -81,11 +89,15 @@ typedef unsigned short u16;
 #define EVEN_FULL ((1u << M_EVEN) - 1u)       /* dense mask of all even columns */
 #define ODD_FULL  ((1u << M_ODD) - 1u)        /* dense mask of all odd columns */
 #define MID       ((NQ_N - 1u) / 2u)          /* the centre column (odd n) */
+/* Columns of each parity up to the centre: the first-row choices of an
+ * odd-square search under the mirror symmetry (odd n only). */
+#define MIRROR_EVEN_RADIX (MID / 2u + 1u)
+#define MIRROR_ODD_RADIX  ((MID - 1u) / 2u + 1u)
 
 /* Layout of the `counters` argument: the ticket counter the threads claim
  * from, then the statistics they add up at exit. Must match COUNTER_* in
  * src/gpu/plan.rs. */
-enum { NEXT_TICKET = 0, TICKETS, DEAD, STEPS, LEAVES, N_COUNTERS };
+enum { NEXT_TICKET = 0, TICKETS, DEAD, STEPS, LEAVES, TALLIED, N_COUNTERS };
 
 /* ---- bit helpers ---- */
 __device__ __forceinline__ u32 lowest_bit(u32 x) { return x & (0u - x); }
@@ -106,12 +118,23 @@ __device__ __forceinline__ u32 row_columns(u32 r, u32 parity) {
  * (2n - 1 diagonals each, so n <= 32 fits). The columns a family attacks
  * in row r are then a shift of its mask, and a queen is placed or removed
  * by the same XOR whatever the current row. */
-__device__ __forceinline__ u64 diag1_bit(u32 bit, u32 r) { return (u64)bit << (NQ_N - 1u - r); }
-__device__ __forceinline__ u64 diag2_bit(u32 bit, u32 r) { return (u64)bit << r; }
+
+/* (u64)bit << k and the low word of d >> k, for 0 <= k < 32 (every shift
+ * below is by a row index or its distance from the last row): one funnel
+ * shift each, where a general 64-bit shift would also handle k >= 32. */
+__device__ __forceinline__ u64 bit_up(u32 bit, u32 k) {
+    return ((u64)__funnelshift_l(bit, 0u, k) << 32) | (bit << k);
+}
+__device__ __forceinline__ u32 low_word_down(u64 d, u32 k) {
+    return __funnelshift_r((u32)d, (u32)(d >> 32), k);
+}
+
+__device__ __forceinline__ u64 diag1_bit(u32 bit, u32 r) { return bit_up(bit, NQ_N - 1u - r); }
+__device__ __forceinline__ u64 diag2_bit(u32 bit, u32 r) { return bit_up(bit, r); }
 
 /* Columns of row r attacked by the queens in `cols`, `d1`, `d2` (or taken). */
 __device__ __forceinline__ u32 attacked(u32 cols, u64 d1, u64 d2, u32 r) {
-    return cols | (u32)(d1 >> (NQ_N - 1u - r)) | (u32)(d2 >> r);
+    return cols | low_word_down(d1, NQ_N - 1u - r) | low_word_down(d2, r);
 }
 
 /* ---- table indexing, as in solution_table.rs ---- */
@@ -147,12 +170,18 @@ __device__ __forceinline__ u32 table_index(u32 cols, u32 parity, u32 odd_stride,
     return rank16(even, rank_lo, rank_hi) * odd_stride + rank16(odd, rank_lo, rank_hi);
 }
 
+/* Adds `weight` to entry i of the packed table at `table`. */
+__device__ __forceinline__ void add_entry(u32* table, u32 i, u32 weight) {
+    atomicAdd(table + (i >> 1), weight << ((i & 1u) * 16u));
+}
+
 /* ---- tickets ---- */
 
 #define WARP 32u
 #define FULL_WARP 0xffffffffu
 #define WARPS_PER_BLOCK ((NQ_BLOCK + WARP - 1u) / WARP)
 #define POOL ((NQ_BLOCK < WARP) ? NQ_BLOCK : WARP)   /* tickets claimed per refill: one per lane */
+#define VOTE_EVERY 4u                                 /* iterations between handouts of work */
 
 /* The item owning ticket t, searched for forward from item `from`: tickets
  * are claimed in increasing order, so a thread's item never moves backwards
@@ -171,15 +200,21 @@ __device__ __forceinline__ u32 find_item(const u64* ticket_base, u32 n_items, u3
     return lo;
 }
 
-/* The number of columns a ticket digit ranges over: the columns of the
- * parity the row's colour requires, or, with the mirror symmetry, for the
- * first row of an odd-square search only those up to the centre. Must match
- * `ticket_count` in src/gpu/plan.rs. */
-__device__ __forceinline__ u32 digit_radix(u32 col_parity, u32 parity, bool first) {
-    u32 radix = (col_parity == 0u) ? M_EVEN : M_ODD;
-    if (NQ_MIRROR && first && parity == 1u) radix = (MID - col_parity) / 2u + 1u;
-    return radix;
+/* Takes the next digit of the ticket number `local`: the digit ranges over
+ * the columns of the parity the row's colour requires, or, with the mirror
+ * symmetry, for the first row of an odd-square search only those up to the
+ * centre (`mirror_first`). Must match `ticket_count` in src/gpu/plan.rs.
+ * Every branch divides by a literal, which compiles to a multiply and a
+ * shift; a division by a runtime radix is some twenty instructions. */
+#define TAKE_DIGIT(local, radix) ((q = (local) % (radix)), ((local) /= (radix)), q)
+__device__ __forceinline__ u32 take_digit(u32& local, u32 col_parity, bool mirror_first) {
+    u32 q;
+    if (NQ_MIRROR && mirror_first) {
+        return (col_parity == 0u) ? TAKE_DIGIT(local, MIRROR_EVEN_RADIX) : TAKE_DIGIT(local, MIRROR_ODD_RADIX);
+    }
+    return (col_parity == 0u) ? TAKE_DIGIT(local, M_EVEN) : TAKE_DIGIT(local, M_ODD);
 }
+#undef TAKE_DIGIT
 
 /* What a ticket's prefix fixes. */
 struct Prefix {
@@ -200,9 +235,7 @@ __device__ __forceinline__ Prefix decode_prefix(u32 local, u32 rows, u32 parity)
         const u32 r = lowest_set(p.rest);
         p.rest &= p.rest - 1u;
         const u32 col_parity = (r & 1u) ^ parity;              /* this row's columns have c % 2 == col_parity */
-        const u32 radix = digit_radix(col_parity, parity, d == 0u);
-        const u32 c = 2u * (local % radix) + col_parity;
-        local /= radix;
+        const u32 c = 2u * take_digit(local, col_parity, d == 0u && parity == 1u) + col_parity;
         const u32 bit = 1u << c;
         if (NQ_MIRROR && d == 0u && parity == 1u) p.weight = (c == MID) ? 1u : 2u;
         p.dead = (attacked(p.cols, p.d1, p.d2, r) & bit) != 0u;
@@ -215,8 +248,12 @@ __device__ __forceinline__ Prefix decode_prefix(u32 local, u32 rows, u32 parity)
 
 /* ---- the pool of decoded prefixes ---- */
 
-/* Slot k of a warp's pool is filled by lane k at a refill. */
-__shared__ u32 pool_item[WARPS_PER_BLOCK][WARP];
+/* Slot k of a warp's pool is filled by lane k at a refill: the decoded
+ * prefix and everything about its item the search needs, so that picking
+ * a prefix up touches no global memory. */
+__shared__ u32 pool_rows[WARPS_PER_BLOCK][WARP];
+__shared__ u32 pool_odd_stride[WARPS_PER_BLOCK][WARP];
+__shared__ u64 pool_table[WARPS_PER_BLOCK][WARP];      /* word offset of the item's table */
 __shared__ u32 pool_cols[WARPS_PER_BLOCK][WARP];
 __shared__ u64 pool_d1[WARPS_PER_BLOCK][WARP];
 __shared__ u64 pool_d2[WARPS_PER_BLOCK][WARP];
@@ -227,12 +264,14 @@ __shared__ u32 pool_weight[WARPS_PER_BLOCK][WARP];
 struct Stats {
     u32 tickets, dead;
     u64 steps, leaves;
+    u64 tallied;        /* sum of the weights added to the tables: the join checks the tables against it */
 
     __device__ __forceinline__ void flush(u64* counters) const {
         atomicAdd(counters + TICKETS, (u64)tickets);
         atomicAdd(counters + DEAD, (u64)dead);
         atomicAdd(counters + STEPS, steps);
         atomicAdd(counters + LEAVES, leaves);
+        atomicAdd(counters + TALLIED, tallied);
     }
 };
 
@@ -257,14 +296,19 @@ __device__ __forceinline__ u32 refill_pool(
     if (t < total && lane < POOL) {
         ++stats.tickets;
         item = find_item(ticket_base, n_items, item, t);
-        const Prefix p = decode_prefix((u32)(t - ticket_base[item]), item_rows[item], parity);
+        const u32 rows = item_rows[item], odd_stride = item_odd_stride[item];
+        const u64 table = item_table[item];
+        const Prefix p = decode_prefix((u32)(t - ticket_base[item]), rows, parity);
         if (p.dead) {
             ++stats.dead;
         } else if (p.rest == 0u) {             /* the prefix is the whole placement (also |R| = 0) */
-            atomicAdd(tables + item_table[item] + table_index(p.cols, parity, item_odd_stride[item], rank_lo, rank_hi), p.weight);
+            add_entry(tables + table, table_index(p.cols, parity, odd_stride, rank_lo, rank_hi), p.weight);
             ++stats.leaves;
+            stats.tallied += p.weight;
         } else {
-            pool_item[warp][lane] = item;
+            pool_rows[warp][lane] = rows;
+            pool_odd_stride[warp][lane] = odd_stride;
+            pool_table[warp][lane] = table;
             pool_cols[warp][lane] = p.cols;
             pool_d1[warp][lane] = p.d1;
             pool_d2[warp][lane] = p.d2;
@@ -326,18 +370,24 @@ struct Ticket {
 
     /* Counts a complete placement with column set `cols`. */
     __device__ __forceinline__ void tally(u32 cols, u32 parity, const u16* rank_lo, const u16* rank_hi) const {
-        atomicAdd(table + table_index(cols, parity, odd_stride, rank_lo, rank_hi), weight);
+        add_entry(table, table_index(cols, parity, odd_stride, rank_lo, rank_hi), weight);
     }
 };
 
-extern "C" __global__ void enumerate_kernel(
+#if NQ_MIN_BLOCKS > 0
+#define LAUNCH_BOUNDS __launch_bounds__(NQ_BLOCK, NQ_MIN_BLOCKS)
+#else
+#define LAUNCH_BOUNDS __launch_bounds__(NQ_BLOCK)
+#endif
+
+extern "C" __global__ LAUNCH_BOUNDS void enumerate_kernel(
     u32 parity,                                /* colour: 0 for r + c even, 1 for r + c odd */
     u32 n_items,
     const u32* __restrict__ item_rows,         /* [n_items] row set of each item (R for parity 0, R̅ for parity 1) */
-    const u64* __restrict__ item_table,        /* [n_items] offset of the item's table in `tables` */
+    const u64* __restrict__ item_table,        /* [n_items] word offset of the item's table in `tables` */
     const u32* __restrict__ item_odd_stride,   /* [n_items] odd stride of that table */
     const u64* __restrict__ ticket_base,       /* [n_items + 1] first ticket of each item; last entry = total */
-    u32* __restrict__ tables,                  /* this colour's tables for the batch, concatenated; zero at launch */
+    u32* __restrict__ tables,                  /* this colour's packed tables for the batch, concatenated; zero at launch */
     const u16* __restrict__ rank_lo,
     const u16* __restrict__ rank_hi,
     u64* __restrict__ counters)                /* [N_COUNTERS] all zero at launch */
@@ -352,13 +402,15 @@ extern "C" __global__ void enumerate_kernel(
     Ticket tk = {0u, 0u, tables, 1u};
     int f = -1;                                /* top frame of the search in progress; -1: none */
     Search s;
-    Stats stats = {0u, 0u, 0ull, 0ull};
+    Stats stats = {0u, 0u, 0ull, 0ull, 0ull};
     u32 live = 0;                              /* pool slots holding a prefix nobody has taken (warp-uniform) */
     bool exhausted = false;                    /* the counter is past the end of the work (warp-uniform) */
+    u32 tick = 0;                              /* iteration counter (warp-uniform) */
 
     for (;;) {
-        /* ---- hand out work: warp-uniform bookkeeping, then the lanes that need it pick up ---- */
-        const u32 need = __ballot_sync(FULL_WARP, f < 0);
+        /* ---- hand out work, every VOTE_EVERY iterations: warp-uniform
+         * bookkeeping, then the lanes that need work pick up ---- */
+        const u32 need = ((tick++ % VOTE_EVERY) == 0u) ? __ballot_sync(FULL_WARP, f < 0) : 0u;
         if (need != 0u) {
             if (live == 0u && !exhausted) {
                 live = refill_pool(counters + NEXT_TICKET, total, lane, warp, parity, item, exhausted, stats,
@@ -369,10 +421,9 @@ extern "C" __global__ void enumerate_kernel(
             const u32 rank = (u32)__popc(need & lanes_below);       /* my place among the lanes that need work */
             if (f < 0 && rank < n_live) {
                 const u32 slot = __fns(live, 0u, (int)rank + 1);    /* the rank-th live slot */
-                const u32 it = pool_item[warp][slot];
-                tk.rows = item_rows[it];
-                tk.odd_stride = item_odd_stride[it];
-                tk.table = tables + item_table[it];
+                tk.rows = pool_rows[warp][slot];
+                tk.odd_stride = pool_odd_stride[warp][slot];
+                tk.table = tables + pool_table[warp][slot];
                 tk.weight = pool_weight[warp][slot];
                 s.cols = pool_cols[warp][slot];
                 s.d1 = pool_d1[warp][slot];
@@ -383,8 +434,8 @@ extern "C" __global__ void enumerate_kernel(
             for (u32 taken = (n_need < n_live) ? n_need : n_live; taken > 0u; --taken) {
                 live &= live - 1u;                                  /* the lowest slots were taken */
             }
-            if (f < 0) continue;                                    /* still nothing to do: wait for the next refill */
         }
+        if (f < 0) continue;                   /* nothing to do until the next handout */
 
         /* ---- one search step, as in the CPU enumerate ---- */
         ++stats.steps;
@@ -401,6 +452,7 @@ extern "C" __global__ void enumerate_kernel(
         if (later == 0u) {                     /* the last row: a complete placement */
             tk.tally(s.cols | bit, parity, rank_lo, rank_hi);
             ++stats.leaves;
+            stats.tallied += tk.weight;
             continue;
         }
         st_col[f][tid] = (unsigned char)lowest_set(bit);
