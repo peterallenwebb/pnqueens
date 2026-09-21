@@ -60,6 +60,10 @@ pub struct GpuOptions {
 #[cfg(feature = "cuda")]
 pub struct RunStats {
     pub gpu: String,
+    /// The configuration the run actually used (the options may have left
+    /// them to the defaults): a verification rerun must differ in these.
+    pub prefix_depth: u32,
+    pub blocks_per_sm: u32,
     pub even: device::LaunchStats,
     pub odd: device::LaunchStats,
     pub join_seconds: f64,
@@ -76,7 +80,9 @@ impl RunStats {
             )
         };
         format!(
-            "{{\"even\": {}, \"odd\": {}, \"join_seconds\": {:.3}, \"max_entry\": {}}}",
+            "{{\"prefix_depth\": {}, \"blocks_per_sm\": {}, \"even\": {}, \"odd\": {}, \"join_seconds\": {:.3}, \"max_entry\": {}}}",
+            self.prefix_depth,
+            self.blocks_per_sm,
             launch(&self.even),
             launch(&self.odd),
             self.join_seconds,
@@ -137,5 +143,13 @@ pub fn count_queens_gpu(
     println!("odd total:  {}", totals[1]);
     println!("join total: {join_seconds:.3}s");
     println!("largest table entry: {max_entry} (16-bit entries; every batch's tables matched the tallies)");
-    Ok(RunStats { gpu: gpu.name().to_string(), even: totals[0], odd: totals[1], join_seconds, max_entry })
+    Ok(RunStats {
+        gpu: gpu.name().to_string(),
+        prefix_depth: gpu.prefix_depth(),
+        blocks_per_sm: gpu.blocks_per_sm(),
+        even: totals[0],
+        odd: totals[1],
+        join_seconds,
+        max_entry,
+    })
 }

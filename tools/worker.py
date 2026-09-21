@@ -13,14 +13,17 @@ finished, so a phase is recorded exactly when its .json exists; phases already
 recorded are skipped unless --redo (verification reruns, with --tag and the
 alternate options after `--`). After every phase the records and the worker's
 log are pushed to the bucket with the signed URLs of DIR/push_urls[_T].env
-(tools/presign.py); a failed push is retried after the next phase, and the
-box's copy stays the primary record.
+(tools/presign.py). A pushed record gets a `.pushed` marker beside it; a
+worker starts by queueing every local record without one, whoever recorded
+it, retries the queue after every phase and at the end, and exits with
+status 2 if anything is still unpushed, so no upload is forgotten across a
+restart or an expired URL. The box's copy stays the primary record.
 
 Every phase is cut from the binary's work map, whose fingerprint the run's
 manifest (DIR/<N>_s<S>/manifest.json, written by the first worker) records:
 a binary with a different work map refuses to run.
 """
-import argparse, json, os, socket, subprocess, sys, time
+import argparse, json, os, re, socket, subprocess, sys, time
 
 ap = argparse.ArgumentParser()
 ap.add_argument("n", type=int)
@@ -85,7 +88,7 @@ else:
 
 # ---- records push
 push_env = a.push_env or os.path.join(a.dir, f"push_urls{tag}.env")
-pending = []          # (url key, path) not yet pushed
+pending = []          # (url key, path) not yet pushed; a record's push is remembered by a .pushed marker
 
 
 def urls():
@@ -94,25 +97,48 @@ def urls():
     return dict(line.strip().split("=", 1) for line in open(push_env) if "=" in line)
 
 
-def push(key, path):
-    pending.append((key, path))
+def queue(key, path):
+    if (key, path) not in pending:
+        pending.append((key, path))
+
+
+def push_pending():
+    """Tries every queued upload; a record that arrives gets its marker."""
     table = urls()
+    failures = []
     for key, path in list(pending):
         url = table.get(key)
         if url is None:
-            if table:
-                log(f"push: no URL for {key} (not in {push_env})")
-            pending.remove((key, path))
+            failures.append(f"{key}: no URL in {push_env}")
             continue
         r = subprocess.run(["curl", "-sS", "-f", "--max-time", "300", "-o", "/dev/null", "-X", "PUT", "-T", path, url], capture_output=True, text=True)
         if r.returncode == 0:
             pending.remove((key, path))
+            if path != logpath:
+                open(path + ".pushed", "w").close()
         else:
-            log(f"push: {key} failed ({(r.stderr or '').strip()[:100]}); will retry")
+            failures.append(f"{key}: {(r.stderr or '').strip()[:80]}")
+    if failures:
+        log(f"push: {len(failures)} upload(s) failed, will retry (first: {failures[0]})")
 
 
-if urls():
-    push("manifest", manifest_path)
+def queue_unpushed_records():
+    """Every record of this run and tag on this box without a .pushed marker."""
+    for name in sorted(os.listdir(rundir)):
+        m = re.match(rf"rowsets_{run}_p(\d+){re.escape(tag)}\.(csv|json)$", name)
+        if m and not os.path.exists(os.path.join(rundir, name + ".pushed")):
+            queue(f"p{m.group(1)}_{m.group(2)}", os.path.join(rundir, name))
+
+
+push_configured = bool(urls())
+if push_configured:
+    queue("manifest", manifest_path)
+    queue_unpushed_records()
+    if pending[1:]:
+        log(f"push: {len(pending) - 1} record(s) from before were never pushed; queued")
+    push_pending()
+else:
+    log(f"push: not configured ({push_env} is absent); records stay on this box")
 
 # ---- the phases
 def recorded(p):
@@ -129,9 +155,9 @@ for i, p in enumerate(todo):
            "--out", base + ".csv.part", "--manifest", base + ".json.part", *a.extra]
     ok = False
     for attempt in range(1 + a.retries):
-        for part in (base + ".csv.part", base + ".json.part"):
-            if os.path.exists(part):
-                os.unlink(part)
+        for stale in (base + ".csv.part", base + ".json.part", base + ".csv.pushed", base + ".json.pushed"):
+            if os.path.exists(stale):
+                os.unlink(stale)
         start = time.time()
         r = subprocess.run(cmd, capture_output=True, text=True, env=env)
         wall = time.time() - start
@@ -150,10 +176,14 @@ for i, p in enumerate(todo):
     avg = sum(walls) / len(walls)
     log(f"phase {p}: total {m['weighted_total']} over {m['row_sets']} row sets in {wall:.0f}s | "
         f"{i + 1}/{len(todo)} done, avg {avg:.0f}s, ETA {left * avg / 3600:.2f} h")
-    push(f"p{p}_csv", base + ".csv")
-    push(f"p{p}_json", base + ".json")
-    push(f"log_{a.label}", logpath)
+    queue(f"p{p}_csv", base + ".csv")
+    queue(f"p{p}_json", base + ".json")
+    queue(f"log_{a.label}", logpath)
+    push_pending()
+queue(f"log_{a.label}", logpath)
+push_pending()
+unpushed = [key for key, path in pending if path != logpath] if push_configured else []
 log(f"worker {a.worker}/{a.workers} ({a.label}) finished: {len(todo) - len(failed)} phases run, "
-    f"{len(failed)} failed{' ' + str(failed) if failed else ''}, {len(pending)} pushes pending")
-push(f"log_{a.label}", logpath)
-sys.exit(1 if failed else 0)
+    f"{len(failed)} failed{' ' + str(failed) if failed else ''}, {len(unpushed)} record(s) not pushed{' ' + str(unpushed) if unpushed else ''}")
+push_pending()
+sys.exit(1 if failed else 2 if unpushed else 0)

@@ -136,8 +136,10 @@ elif a.command == "stop":
     everywhere(fleet, lambda b: ssh(b, f"kill $(cat runs/worker_{run}.pid) 2>/dev/null && echo stopped || echo 'not running'"))
 elif a.command == "status":
     everywhere(fleet, lambda b: ssh(b, f"last=$(tail -n 1 runs/{run}/logs/{b[2]}.log 2>/dev/null); "
+                                       f"unpushed=$(( $(ls runs/{run}/rowsets_*.csv runs/{run}/rowsets_*.json 2>/dev/null | wc -l) - $(ls runs/{run}/*.pushed 2>/dev/null | wc -l) )); "
                                        f"if kill -0 $(cat runs/worker_{run}.pid 2>/dev/null) 2>/dev/null; then echo -n 'ALIVE  '; "
-                                       f"elif echo \"$last\" | grep -q finished; then echo -n 'DONE   '; else echo -n 'DEAD   '; fi; echo \"${{last:-(no log)}}\""))
+                                       f"elif echo \"$last\" | grep -q finished; then echo -n 'DONE   '; else echo -n 'DEAD   '; fi; "
+                                       f"[ \"$unpushed\" -gt 0 ] && echo -n \"$unpushed UNPUSHED  \"; echo \"${{last:-(no log)}}\""))
     sys.exit(subprocess.run([sys.executable, os.path.join(HERE, "status.py"), str(a.n), "--stride", str(a.stride)]).returncode)
 elif a.command == "cmd":
     everywhere(fleet, lambda b: ssh(b, "cd pnqueens && " + " ".join(a.rest)))

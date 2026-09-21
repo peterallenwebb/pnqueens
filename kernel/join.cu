@@ -59,7 +59,8 @@ extern "C" __global__ void join_kernel(
         part += (u64)e0 * o0 + (u64)e1 * o1;
         sum_e += e0 + e1;
         sum_o += o0 + o1;
-        const u32 m = ((e0 > e1) ? e0 : e1) | ((o0 > o1) ? o0 : o1);   /* an upper bound is enough for a max */
+        const u32 me = (e0 > e1) ? e0 : e1, mo = (o0 > o1) ? o0 : o1;
+        const u32 m = (me > mo) ? me : mo;
         largest = (m > largest) ? m : largest;
     }
 

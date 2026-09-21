@@ -6,7 +6,7 @@ foreign work map, and the binary's --sum saying ok.
 
     python3 tools/test_tools.py [--binary B]
 """
-import argparse, json, os, shutil, subprocess, sys, tempfile
+import argparse, glob, json, os, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ap = argparse.ArgumentParser()
@@ -61,6 +61,44 @@ def validation_exit_tests():
     shutil.copy(os.path.join(d, "good.json"), os.path.join(rundir, "rowsets_8_s1_p0_verify.json"))
     r = subprocess.run([sys.executable, os.path.join(HERE, "status.py"), "8", "--stride", "1", "--dir", tmp, "--no-sync", "--binary", binary], capture_output=True, text=True)
     assert r.returncode != 0 and "CONFLICT" in r.stdout + r.stderr, (r.returncode, r.stdout, r.stderr)
+
+
+def push_tests():
+    """Uploads that fail are not forgotten: a worker whose pushes all fail
+    exits 2 and leaves no markers; restarted with a working destination it
+    has no phases to run but pushes the backlog and exits 0."""
+    import http.server, threading
+    received = []
+
+    class Put(http.server.BaseHTTPRequestHandler):
+        def do_PUT(self):
+            received.append(self.path)
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Put)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    d = os.path.join(tmp, "push")
+    os.makedirs(d)
+    keys = [f"p{p}_{ext}" for p in range(4) for ext in ("csv", "json")] + ["manifest", "log_x"]
+    with open(os.path.join(d, "dead.env"), "w") as f:
+        f.write("".join(f"{k}=http://127.0.0.1:9/{k}\n" for k in keys))
+    with open(os.path.join(d, "live.env"), "w") as f:
+        f.write("".join(f"{k}=http://127.0.0.1:{server.server_port}/{k}\n" for k in keys))
+    r = subprocess.run([sys.executable, os.path.join(HERE, "worker.py"), N, "--stride", S, "--dir", d, "--binary", binary, "--cpu",
+                        "--label", "x", "--push-env", os.path.join(d, "dead.env")], capture_output=True, text=True)
+    assert r.returncode == 2 and "9 record(s) not pushed" in r.stdout, (r.returncode, r.stdout)   # 4 phases x 2 files + the manifest
+    assert not glob.glob(os.path.join(d, run, "*.pushed"))
+    r = subprocess.run([sys.executable, os.path.join(HERE, "worker.py"), N, "--stride", S, "--dir", d, "--binary", binary, "--cpu",
+                        "--label", "x", "--push-env", os.path.join(d, "live.env")], capture_output=True, text=True)
+    assert r.returncode == 0 and "0 to do" in r.stdout and "8 record(s) from before were never pushed" in r.stdout, (r.returncode, r.stdout)
+    assert len(glob.glob(os.path.join(d, run, "*.pushed"))) == 9
+    assert {p.strip("/") for p in received} >= set(keys), received
+    server.shutdown()
 
 
 def ship_tests():
@@ -126,6 +164,7 @@ try:
     worker("--phases", "2", "--redo", "--tag", "verify", "--label", "a")
     out = status()
     assert "(1 more than once)" in out and "recorded more than once, all in agreement" in out and "Q(12): 14200 ok" in out, out
+    assert "WARNING: phases [2] were recorded more than once in the same configuration" in out, out   # the CPU has one configuration
     # Resume: nothing left to do for worker 0.
     r = worker("--worker", "0", "--workers", "2", "--label", "a")
     assert "0 to do" in r.stdout, r.stdout
@@ -137,6 +176,7 @@ try:
     assert r.returncode != 0 and "REFUSED" in (r.stdout + r.stderr), r.stdout + r.stderr
     ship_tests()
     validation_exit_tests()
+    push_tests()
     print("all tool tests passed")
 finally:
     shutil.rmtree(tmp)

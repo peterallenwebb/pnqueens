@@ -89,9 +89,11 @@ pub struct Gpu {
     name: String,
     enumerate: CudaFunction,
     join: CudaFunction,
-    /// Blocks and threads per block of an enumerate launch.
+    /// Blocks and threads per block of an enumerate launch, and the blocks
+    /// resident per multiprocessor.
     grid: u32,
     block: u32,
+    blocks_per_sm: u32,
     prefix_depth: u32,
     rank_lo: CudaSlice<u16>,
     rank_hi: CudaSlice<u16>,
@@ -171,11 +173,15 @@ impl Gpu {
         let counters = dev.alloc_zeros(N_COUNTERS).map_err(cuda_err)?;
         let entry_sums = dev.alloc_zeros(2).map_err(cuda_err)?;
         let max_entry = dev.alloc_zeros(1).map_err(cuda_err)?;
-        Ok(Gpu { dev, name, enumerate, join, grid, block, prefix_depth, rank_lo, rank_hi, tables, budget_words, counters, entry_sums, max_entry })
+        Ok(Gpu { dev, name, enumerate, join, grid, block, blocks_per_sm, prefix_depth, rank_lo, rank_hi, tables, budget_words, counters, entry_sums, max_entry })
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn blocks_per_sm(&self) -> u32 {
+        self.blocks_per_sm
     }
 
     pub fn prefix_depth(&self) -> u32 {

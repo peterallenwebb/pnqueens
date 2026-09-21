@@ -58,11 +58,16 @@ its own total and exits 1 on a failure; `--mod8 TOTAL` exits 1 on FAIL.
    machinery before a new term is attempted.
 3. **The mod-8 identity** Q ≡ S₂ (mod 8), with S₂ the number of solutions
    fixed by the 180° rotation, counted by a search that shares nothing with
-   the decomposition (`symmetric.rs`; `pnqueens N --mod8 TOTAL`).
+   the decomposition (`symmetric.rs`; `pnqueens N --mod8 TOTAL`). This is a
+   limited consistency check: an error that is a multiple of 8 passes it.
+   For a count with no reference value, Q(29), the weight rests on the
+   other three checks and on the per-row-set records themselves.
 4. **A verification sample.** A few percent of the phases are recomputed in
    another configuration of the kernel (prefix depth, residency), which
    changes the ticket decomposition and the order of every table update but
-   must reproduce every row-set count exactly (RUNBOOK.md).
+   must reproduce every row-set count exactly (RUNBOOK.md). The manifests
+   record the effective configuration, and `status.py` warns when a
+   duplicate ran in the same one as the original.
 
 **Provenance.** Every record file carries the source commit (the build
 refuses to ship a dirty tree, so it is the commit that was built), the
@@ -75,7 +80,7 @@ join sums the entries of each colour and the host requires the sum to equal
 the weights the searches tallied; an entry that overflowed would have carried
 into its neighbour and changed the sum, so every batch of every run is
 proven free of overflow (the largest entries seen are 291 at n = 22, 982 at
-n = 24, 2,224 at n = 25). Per-row-set counts are u64, totals u128.
+n = 24, at most 2,224 at n = 25, measured as a bound). Per-row-set counts are u64, totals u128.
 
 ## 4. Auditing a release
 
