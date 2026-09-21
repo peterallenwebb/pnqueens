@@ -66,61 +66,88 @@
 mod gpu;
 mod rowset_log;
 mod solution_table;
+mod symmetric;
+mod work;
 
 use rayon::prelude::*;
 use rowset_log::{read_rowset_files, RowsetCount, RowsetLog};
+use sha2::{Digest, Sha256};
 use solution_table::{split_columns, SolutionTable};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Instant;
+use work::{feasible_row_sets, fingerprint, work_items, RowSet, Selection};
 
 fn main() {
     let args = parse_args();
-    if let Some(files) = &args.sum_files {
-        retabulate(files);
-        return;
+    match &args.mode {
+        Mode::Count => count(&args),
+        Mode::Items => print_items(args.n),
+        Mode::RowSet(mask) => audit_rowset(args.n, *mask),
+        Mode::Mod8(total) => mod8_check(args.n, *total),
+        Mode::Sum(files) => retabulate(files),
     }
+}
+
+/// Q(n), or one phase of it: the selected row sets are counted, on the GPU
+/// or the CPU, into a record file headed by the run's provenance, and a JSON
+/// manifest describes the run.
+fn count(args: &Args) {
     let n = args.n;
-    let out = args.out.clone().unwrap_or_else(|| PathBuf::from(format!("rowsets_{n}.csv")));
-    let mut log = RowsetLog::create(&out, n).unwrap_or_else(|e| fail(&format!("cannot create {}: {e}", out.display())));
-    if args.cuda {
-        count_queens_on_gpu(&args, &mut log);
-    } else {
-        count_queens(n, &mut log);
-    }
+    let start = Instant::now();
+    let items = work_items(n);
+    let workmap = fingerprint(n, &items);
+    let selected: Vec<RowSet> = args.selection.pick(&items).copied().collect();
+    let out = args.out.clone().unwrap_or_else(|| default_output(n, args.selection));
+    let manifest_path = args.manifest.clone().unwrap_or_else(|| out.with_extension("json"));
+    let identity = Identity::of_this_run();
+    let provenance = format!(
+        "pnqueens n={n} stride={} phase={} workmap={workmap:016x} items={} device={} commit={} binary={}",
+        args.selection.stride,
+        args.selection.phase,
+        selected.len(),
+        if args.cuda { "cuda" } else { "cpu" },
+        identity.commit,
+        identity.binary_sha256
+    );
+    let mut log = RowsetLog::create(&out, n, &provenance).unwrap_or_else(|e| fail(&format!("cannot create {}: {e}", out.display())));
+    println!("PREPARED {} of {} row sets (stride {}, phase {}, work map {workmap:016x})", selected.len(), items.len(), args.selection.stride, args.selection.phase);
+    let device = if args.cuda { count_on_gpu(args, &selected, &mut log) } else { count_on_cpu(n, &selected, &mut log) };
     log.flush().unwrap_or_else(|e| fail(&format!("cannot write {}: {e}", out.display())));
     println!("{} row-set counts written to {}", log.written(), out.display());
-    report(n, log.total(), true);
-}
-
-/// Re-tabulate Q(n) from row-set files and check that they cover
-/// every feasible row set exactly once with the right weight.
-fn retabulate(files: &[String]) {
-    let (n, rows) = read_rowset_files(files).unwrap_or_else(|e| fail(&e));
-    let expected = get_feasible_even_row_combos(n);
-    let mut seen: std::collections::HashMap<u32, u32> = expected.iter().map(|rc| (rc.mask, rc.weight as u32)).collect();
-    let mut total: u128 = 0;
-    for row in &rows {
-        match seen.remove(&row.mask) {
-            Some(weight) if weight == row.weight => {}
-            Some(weight) => fail(&format!("row set {:08x} has weight {}, expected {weight}", row.mask, row.weight)),
-            None if expected.iter().any(|rc| rc.mask == row.mask) => fail(&format!("row set {:08x} appears twice", row.mask)),
-            None => fail(&format!("row set {:08x} is not a feasible row set for n = {n}", row.mask)),
-        }
-        total += u128::from(row.weighted());
+    if args.selection.is_all() {
+        report(n, log.total());
+    } else {
+        println!("Q({n}) phase {} of {}: {} PARTIAL", args.selection.phase, args.selection.stride, log.total());
     }
-    println!("{} of {} row sets present", rows.len(), expected.len());
-    report(n, total, seen.is_empty());
+    let manifest = Manifest {
+        n,
+        selection: args.selection,
+        workmap,
+        items: selected.len(),
+        identity,
+        device,
+        options: format!(
+            "{{\"prefix\": {}, \"blocks_per_sm\": {}, \"table_mem_mib\": {}}}",
+            json_opt(args.prefix_depth),
+            json_opt(args.blocks_per_sm),
+            args.table_mem_mib
+        ),
+        wall_s: start.elapsed().as_secs_f64(),
+        row_sets: log.written(),
+        weighted_total: log.total(),
+    };
+    std::fs::write(&manifest_path, manifest.to_json()).unwrap_or_else(|e| fail(&format!("cannot write {}: {e}", manifest_path.display())));
+    println!("manifest written to {}", manifest_path.display());
 }
 
-/// Prints the result, labelled against the known value when the count is
-/// complete and n is in the known range.
-fn report(n: u32, total: u128, complete: bool) {
-    let status = match (complete, known(n)) {
-        (false, _) => " PARTIAL",
-        (true, Some(k)) if k == total => " ok",
-        (true, Some(_)) => " MISMATCH",
-        (true, None) => "",
-    };
-    println!("Q({n}): {total}{status}");
+/// `rowsets_<n>.csv`, or `rowsets_<n>_s<stride>_p<phase>.csv` for a phase.
+fn default_output(n: u32, selection: Selection) -> PathBuf {
+    if selection.is_all() {
+        PathBuf::from(format!("rowsets_{n}.csv"))
+    } else {
+        PathBuf::from(format!("rowsets_{n}_s{}_p{}.csv", selection.stride, selection.phase))
+    }
 }
 
 fn fail(msg: &str) -> ! {
@@ -128,20 +155,221 @@ fn fail(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-#[cfg(feature = "cuda")]
-fn count_queens_on_gpu(args: &Args, log: &mut RowsetLog) {
-    let opts = gpu::GpuOptions {
-        device: args.device,
-        prefix_depth: args.prefix_depth,
-        table_budget_bytes: args.table_mem_mib << 20,
-        blocks_per_sm: args.blocks_per_sm,
-    };
-    gpu::count_queens_gpu(args.n, &opts, log).unwrap_or_else(|e| fail(&e));
+// ---- provenance and the manifest
+
+/// What identifies the program and the machine that produced a record.
+struct Identity {
+    /// The source commit the binary was built from (build.rs), "-dirty" if
+    /// the tree had uncommitted changes.
+    commit: String,
+    /// SHA-256 of the running executable.
+    binary_sha256: String,
+    host: String,
 }
 
-#[cfg(not(feature = "cuda"))]
-fn count_queens_on_gpu(_args: &Args, _log: &mut RowsetLog) {
-    fail("this binary was built without the cuda feature (cargo build --release --features cuda)");
+impl Identity {
+    fn of_this_run() -> Self {
+        let binary_sha256 = std::env::current_exe()
+            .and_then(std::fs::read)
+            .map(|bytes| format!("{:x}", Sha256::digest(&bytes)))
+            .unwrap_or_else(|_| "unknown".into());
+        let host = std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| "unknown".into());
+        Identity { commit: env!("PNQUEENS_COMMIT").to_string(), binary_sha256, host }
+    }
+}
+
+/// What the run has to say about the device it ran on, for the manifest.
+struct Device {
+    name: &'static str,
+    /// The GPU's name, if any.
+    gpu: Option<String>,
+    /// The device path's statistics as a JSON value ("null" for the CPU).
+    stats: String,
+}
+
+/// The JSON description of a run, written next to its record file.
+struct Manifest {
+    n: u32,
+    selection: Selection,
+    workmap: u64,
+    items: usize,
+    identity: Identity,
+    device: Device,
+    options: String,
+    wall_s: f64,
+    row_sets: usize,
+    weighted_total: u128,
+}
+
+impl Manifest {
+    fn to_json(&self) -> String {
+        format!(
+            "{{\n  \"program\": \"pnqueens\",\n  \"n\": {},\n  \"stride\": {},\n  \"phase\": {},\n  \"workmap\": \"{:016x}\",\n  \"items\": {},\n  \
+             \"commit\": {},\n  \"binary_sha256\": {},\n  \"host\": {},\n  \"device\": \"{}\",\n  \"gpu\": {},\n  \"options\": {},\n  \
+             \"wall_s\": {:.3},\n  \"row_sets\": {},\n  \"weighted_total\": \"{}\",\n  \"stats\": {}\n}}\n",
+            self.n,
+            self.selection.stride,
+            self.selection.phase,
+            self.workmap,
+            self.items,
+            json_string(&self.identity.commit),
+            json_string(&self.identity.binary_sha256),
+            json_string(&self.identity.host),
+            self.device.name,
+            self.device.gpu.as_deref().map_or("null".to_string(), json_string),
+            self.options,
+            self.wall_s,
+            self.row_sets,
+            self.weighted_total,
+            self.device.stats
+        )
+    }
+}
+
+fn json_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_opt(v: Option<u32>) -> String {
+    v.map_or("null".to_string(), |v| v.to_string())
+}
+
+// ---- the other modes
+
+/// The size of the work and its fingerprint, without counting anything.
+fn print_items(n: u32) {
+    let items = work_items(n);
+    println!("n={n} items={} workmap={:016x}", items.len(), fingerprint(n, &items));
+}
+
+/// One row set's count on the CPU, printed as the record line it should
+/// match: the audit of a single line of a run's records, needing no GPU.
+fn audit_rowset(n: u32, mask: u32) {
+    let Some(row_set) = feasible_row_sets(n).into_iter().find(|r| r.mask == mask) else {
+        fail(&format!("{mask:08x} is not a representative feasible row set for n = {n} (see feasible_row_sets)"));
+    };
+    let start = Instant::now();
+    let count = count_solutions(n, &row_set);
+    println!("{n},{mask:08x},{},{count}", row_set.weight);
+    eprintln!("({:.1}s on the CPU)", start.elapsed().as_secs_f64());
+}
+
+/// The number of solutions fixed by the 180° rotation, and, given a total,
+/// whether Q ≡ S2 (mod 8) holds for it (see symmetric.rs).
+fn mod8_check(n: u32, total: Option<u128>) {
+    let start = Instant::now();
+    let s2 = symmetric::rotation_fixed_solutions(n);
+    match total {
+        Some(q) => println!("mod-8 check: {} (Q ≡ {}, S2 = {s2} ≡ {} mod 8, {:.1}s)", if q % 8 == u128::from(s2) % 8 { "PASS" } else { "FAIL" }, q % 8, s2 % 8, start.elapsed().as_secs_f64()),
+        None => println!("S2({n}) = {s2} ({:.1}s)", start.elapsed().as_secs_f64()),
+    }
+}
+
+/// Re-tabulates Q(n) from record files and checks them: one work map across
+/// the files, the phases of a stride present, duplicate row sets in
+/// agreement, every feasible row set exactly once with the right weight, the
+/// total against the published value, and the mod-8 identity.
+fn retabulate(files: &[String]) {
+    let records = read_rowset_files(files).unwrap_or_else(|e| fail(&e));
+    let n = records.n;
+
+    // Provenance: every file that carries a work map must carry the same one.
+    let workmaps: std::collections::BTreeSet<&str> = records.provenance.iter().filter_map(|(_, p)| p.get("workmap").map(String::as_str)).collect();
+    if workmaps.len() > 1 {
+        fail(&format!("the files were cut from different work maps: {}", workmaps.into_iter().collect::<Vec<_>>().join(", ")));
+    }
+    let this_workmap = format!("{:016x}", fingerprint(n, &work_items(n)));
+    if let Some(&recorded) = workmaps.iter().next()
+        && recorded != this_workmap
+    {
+        println!("note: the records' work map {recorded} is not this binary's {this_workmap}; the row sets are checked regardless");
+    }
+    // Phases: with one stride across the files, which phases are present.
+    let strides: std::collections::BTreeSet<u32> = records.provenance.iter().filter_map(|(_, p)| p.get("stride")?.parse().ok()).collect();
+    if let (Some(&stride), 1) = (strides.iter().next(), strides.len()) {
+        let mut phases: Vec<u32> = records.provenance.iter().filter_map(|(_, p)| p.get("phase")?.parse().ok()).collect();
+        phases.sort_unstable();
+        phases.dedup();
+        let missing: Vec<u32> = (0..stride).filter(|p| phases.binary_search(p).is_err()).collect();
+        println!("phases: {} of {stride} present{}", phases.len(), if missing.is_empty() { String::new() } else { format!(", missing {}", summarize(&missing)) });
+    } else if strides.len() > 1 {
+        fail(&format!("the files have different strides: {strides:?}"));
+    }
+
+    // Row sets: each feasible one exactly once, or several times in agreement.
+    let expected: BTreeMap<u32, u32> = feasible_row_sets(n).iter().map(|r| (r.mask, r.weight)).collect();
+    let mut seen: BTreeMap<u32, RowsetCount> = BTreeMap::new();
+    let mut verified = 0usize;
+    for row in &records.rows {
+        match expected.get(&row.mask) {
+            Some(&weight) if weight == row.weight => {}
+            Some(weight) => fail(&format!("row set {:08x} has weight {}, expected {weight}", row.mask, row.weight)),
+            None => fail(&format!("row set {:08x} is not a representative feasible row set for n = {n}", row.mask)),
+        }
+        match seen.insert(row.mask, *row) {
+            None => {}
+            Some(earlier) if earlier == *row => verified += 1,
+            Some(earlier) => fail(&format!("CONFLICT: row set {:08x} recorded as {} and as {}", row.mask, earlier.count, row.count)),
+        }
+    }
+    let total: u128 = seen.values().map(|r| u128::from(r.weighted())).sum();
+    let complete = seen.len() == expected.len();
+    println!(
+        "{} of {} row sets present in {} files ({} recorded more than once, all in agreement)",
+        seen.len(),
+        expected.len(),
+        files.len(),
+        verified
+    );
+    if complete {
+        report(n, total);
+        mod8_check(n, Some(total));
+    } else {
+        println!("Q({n}): {total} PARTIAL");
+    }
+}
+
+/// "3, 7-9, 12" for a sorted list.
+fn summarize(xs: &[u32]) -> String {
+    let mut parts = Vec::new();
+    let mut i = 0;
+    while i < xs.len() {
+        let mut j = i;
+        while j + 1 < xs.len() && xs[j + 1] == xs[j] + 1 {
+            j += 1;
+        }
+        parts.push(if j > i { format!("{}-{}", xs[i], xs[j]) } else { xs[i].to_string() });
+        i = j + 1;
+    }
+    parts.join(", ")
+}
+
+/// Prints a complete count, labelled against the published value or the
+/// reference project's value when there is one.
+fn report(n: u32, total: u128) {
+    let status = match (known(n), reference(n)) {
+        (Some(k), _) if k == total => " ok",
+        (Some(_), _) => " MISMATCH",
+        (None, Some(r)) if r == total => " matches the reference project's value",
+        (None, Some(_)) => " DIFFERS from the reference project's value",
+        (None, None) => " (no reference value)",
+    };
+    println!("Q({n}): {total}{status}");
 }
 
 /// Q(n) for 1 <= n <= 27, OEIS A000170. Used to label results and in tests.
@@ -155,142 +383,49 @@ fn known(n: u32) -> Option<u128> {
     KNOWN.get(n as usize - 1).copied()
 }
 
-// Q(n): the sum over feasible even-queen row sets R of E[R, C] * O[R̅, C̅],
-// weighted by the size of each R's symmetry orbit. Every row set's count is
-// recorded in `log`, which keeps the weighted total.
-fn count_queens(n: u32, log: &mut RowsetLog) {
-    let ercs = get_feasible_even_row_combos(n);
+/// Values computed by another program (the reference project's balanced
+/// checkerboard join on a fleet of RTX 5090s, 2026-09-11), not yet published.
+fn reference(n: u32) -> Option<u128> {
+    (n == 28).then_some(2_564_269_152_506_723_832)
+}
 
-    println!("PREPARED {}", ercs.len());
+// ---- counting
 
-    // Each row combo is an independent search, so count them in parallel;
-    // rayon's work stealing absorbs the large variation in per-combo cost.
-    // `collect` keeps the input order, so the log is in row-set order.
-    let results: Vec<RowsetCount> = ercs
+/// The selected row sets counted on the CPU, each an independent search,
+/// in parallel. `collect` keeps the order, so the records are in item order.
+fn count_on_cpu(n: u32, items: &[RowSet], log: &mut RowsetLog) -> Device {
+    let results: Vec<RowsetCount> = items
         .par_iter()
-        .map(|erc| RowsetCount { mask: erc.mask, weight: erc.weight as u32, count: count_solutions(n, erc) })
+        .map(|item| RowsetCount { mask: item.mask, weight: item.weight, count: count_solutions(n, item) })
         .collect();
     for r in &results {
         log.record(r).unwrap_or_else(|e| fail(&format!("cannot write row-set counts: {e}")));
     }
+    Device { name: "cpu", gpu: None, stats: "null".into() }
 }
 
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-struct Args {
-    /// Board size. To simplify bitmask arithmetic, we enforce 1 <= n <= 31.
-    n: u32,
-    /// Run on a CUDA GPU instead of the CPU.
-    cuda: bool,
-    /// CUDA device index (--device).
-    device: usize,
-    /// Ticket prefix depth (--prefix); None means the GPU path's default for n.
-    prefix_depth: Option<u32>,
-    /// Device memory for one batch's tables, in MiB (--table-mem).
-    table_mem_mib: usize,
-    /// Resident blocks per multiprocessor (--blocks-per-sm); None means as many as fit.
-    blocks_per_sm: Option<u32>,
-    /// Where to write the per-row-set counts (--out); None means rowsets_<n>.csv.
-    out: Option<PathBuf>,
-    /// `--sum FILE...`: re-tabulate from row-set files instead of counting.
-    sum_files: Option<Vec<String>>,
-}
-
-// Parse the command line. Exit with a usage message on any problem.
-fn parse_args() -> Args {
-    let argv: Vec<String> = std::env::args().collect();
-    let usage = || -> ! {
-        eprintln!(
-            "usage: {0} <n> [--cuda] [--device I] [--prefix P] [--table-mem MiB] [--blocks-per-sm B] [--out FILE]\n\
-             \x20      {0} --sum FILE...\n\
-             \x20 1 <= n <= 31\n\
-             \x20 --cuda        Run on a CUDA GPU (build with --features cuda)\n\
-             \x20 --device I    (CUDA mode only) CUDA device index (default 0)\n\
-             \x20 --prefix P    (CUDA mode only) Rows fixed per GPU ticket (default: the least that keeps the tables in flight within L2)\n\
-             \x20 --table-mem M (CUDA mode only) Device memory for tables per batch, MiB (default 8192)\n\
-             \x20 --blocks-per-sm B (CUDA mode only) Resident blocks per multiprocessor (default: as many as fit; fewer only for measurements)\n\
-             \x20 --out FILE    Per-row-set counts, CSV (default rowsets_<n>.csv; never overwritten)\n\
-             \x20 --sum FILE... Re-tabulate Q(n) from row-set files and check they are complete",
-            argv.first().map_or("pnqueens", String::as_str)
-        );
-        std::process::exit(2);
+#[cfg(feature = "cuda")]
+fn count_on_gpu(args: &Args, items: &[RowSet], log: &mut RowsetLog) -> Device {
+    let opts = gpu::GpuOptions {
+        device: args.device,
+        prefix_depth: args.prefix_depth,
+        table_budget_bytes: args.table_mem_mib << 20,
+        blocks_per_sm: args.blocks_per_sm,
     };
-    let mut args = Args { n: 0, cuda: false, device: 0, prefix_depth: None, table_mem_mib: 8192, blocks_per_sm: None, out: None, sum_files: None };
-    let mut n = None;
-    let mut rest = argv.iter().skip(1);
-    while let Some(arg) = rest.next() {
-        let mut value = |what: &str| -> String { rest.next().cloned().unwrap_or_else(|| { eprintln!("{what} needs a value"); usage() }) };
-        match arg.as_str() {
-            "--cuda" => args.cuda = true,
-            "--device" => args.device = value("--device").parse().unwrap_or_else(|_| usage()),
-            "--prefix" => args.prefix_depth = Some(value("--prefix").parse().unwrap_or_else(|_| usage())),
-            "--table-mem" => args.table_mem_mib = value("--table-mem").parse().unwrap_or_else(|_| usage()),
-            "--blocks-per-sm" => args.blocks_per_sm = Some(value("--blocks-per-sm").parse().unwrap_or_else(|_| usage())),
-            "--out" => args.out = Some(PathBuf::from(value("--out"))),
-            "--sum" => {
-                // Everything after --sum is a file name.
-                let files: Vec<String> = rest.by_ref().cloned().collect();
-                if files.is_empty() {
-                    usage();
-                }
-                args.sum_files = Some(files);
-            }
-            other => match other.parse::<u32>() {
-                Ok(v) if (1..=31).contains(&v) && n.is_none() => n = Some(v),
-                _ => usage(),
-            },
-        }
-    }
-    if args.sum_files.is_some() {
-        if n.is_some() || args.cuda || args.out.is_some() {
-            usage();
-        }
-        return args;
-    }
-    args.n = n.unwrap_or_else(|| usage());
-    args
+    let stats = gpu::count_queens_gpu(args.n, &opts, items, log).unwrap_or_else(|e| fail(&e));
+    Device { name: "cuda", gpu: Some(stats.gpu.clone()), stats: stats.to_json() }
 }
 
-struct RowCombo {
-    pub mask: u32,
-    pub weight: i32,
+#[cfg(not(feature = "cuda"))]
+fn count_on_gpu(_args: &Args, _items: &[RowSet], _log: &mut RowsetLog) -> Device {
+    fail("this binary was built without the cuda feature (cargo build --release --features cuda)");
 }
 
-fn get_feasible_even_row_combos(n: u32) -> Vec<RowCombo> {
-    let mut feasible_combos: Vec<RowCombo> = Vec::new();
-    let mut rowset: u32 = 0;
-    while rowset < (1 << n) {
-        // To be feasible, the count of rows with r = 0 mod 2, less the
-        // count of rows with r = 1 mod 2, must be 0 for even n, and 1 for odd.
-        let k00 = (rowset & 0x5555_5555).count_ones() as i32;
-        let k11 = (rowset & 0xAAAA_AAAA).count_ones() as i32;
-        if k00 - k11 == (n % 2) as i32 {
-            // We also cull combos that are symmetric under reflection if they are
-            // lexically greater than their reflection. Marking the latter as
-            // double-weighted to compensate.
-            let reflection = reflect(n, rowset);
-
-            if rowset <= reflection {
-                if n % 2 == 1 {
-                    feasible_combos.push(RowCombo { mask: rowset, weight: if rowset == reflection { 1 } else { 2 } });
-                } else {
-                    let rc = reflect(n, complement(n, rowset));
-                    if rowset <= rc {
-                        let weight = if rowset == reflection || rowset == rc { 2 } else { 4 };
-                        feasible_combos.push(RowCombo { mask: rowset, weight });
-                    }
-                }
-            }
-        }
-
-        rowset += 1;
-    }
-    return feasible_combos;
-}
-
-fn count_solutions(n: u32, even_queen_rows: &RowCombo) -> u64 {
-    match get_erc(n, even_queen_rows.mask) {
+/// One row set's count: sum over C of E[R, C] * O[R̅, C̅], on the CPU.
+fn count_solutions(n: u32, row_set: &RowSet) -> u64 {
+    match get_erc(n, row_set.mask) {
         None => 0,
-        Some(erc) => backtrack_odd_solutions(n, &erc, complement(n, even_queen_rows.mask)),
+        Some(erc) => backtrack_odd_solutions(n, &erc, work::complement(n, row_set.mask)),
     }
 }
 
@@ -304,16 +439,6 @@ fn get_erc(n: u32, row_bitmask: u32) -> Option<SolutionTable> {
         table.increment_dense(even, odd);
     });
     (leaves > 0).then_some(table)
-}
-
-// Complement an n-bit bitmask
-fn complement(n: u32, x: u32) -> u32 {
-    return !x & ((1 << n) - 1);
-}
-
-// Reflect an n-bit bitmask
-fn reflect(n: u32, x: u32) -> u32 {
-    return x.reverse_bits() >> (32 - n);
 }
 
 // Run a conventional backtracking search to find all partial n-queens solutions
@@ -346,7 +471,7 @@ fn backtrack_odd_solutions(n: u32, erc: &SolutionTable, rcomp: u32) -> u64 {
 // first row to restrict: with no rows there is one empty placement, which is
 // its own mirror image and must be counted once.
 fn mirror_columns(n: u32, rows: u32) -> Option<(u32, u32)> {
-    if n % 2 == 0 || rows == 0 {
+    if n.is_multiple_of(2) || rows == 0 {
         return None;
     }
     let mid = (n - 1) / 2;
@@ -427,6 +552,144 @@ fn enumerate(n: u32, rows: u32, parity: u32, first_row_columns: u32, mut leaf: i
     leaves
 }
 
+// ---- the command line
+
+enum Mode {
+    /// Count the selected row sets (the default).
+    Count,
+    /// `--items`: the item count and work map fingerprint.
+    Items,
+    /// `--rowset HEX`: one row set on the CPU.
+    RowSet(u32),
+    /// `--mod8 [TOTAL]`: the rotation-fixed count, and the check of a total.
+    Mod8(Option<u128>),
+    /// `--sum FILE...`: re-tabulate and check record files.
+    Sum(Vec<String>),
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+struct Args {
+    /// Board size. To simplify bitmask arithmetic, we enforce 1 <= n <= 31.
+    n: u32,
+    mode: Mode,
+    /// Run on a CUDA GPU instead of the CPU.
+    cuda: bool,
+    /// CUDA device index (--device).
+    device: usize,
+    /// Ticket prefix depth (--prefix); None means the GPU path's default for n.
+    prefix_depth: Option<u32>,
+    /// Device memory for one batch's tables, in MiB (--table-mem).
+    table_mem_mib: usize,
+    /// Resident blocks per multiprocessor (--blocks-per-sm); None means as many as fit.
+    blocks_per_sm: Option<u32>,
+    /// The phase of the work to count (--stride, --phase).
+    selection: Selection,
+    /// Where to write the per-row-set counts (--out).
+    out: Option<PathBuf>,
+    /// Where to write the run's manifest (--manifest); None means next to the counts.
+    manifest: Option<PathBuf>,
+}
+
+// Parse the command line. Exit with a usage message on any problem.
+fn parse_args() -> Args {
+    let argv: Vec<String> = std::env::args().collect();
+    let usage = || -> ! {
+        eprintln!(
+            "usage: {0} <n> [--cuda] [--device I] [--prefix P] [--table-mem MiB] [--blocks-per-sm B]\n\
+             \x20                 [--stride S --phase P] [--out FILE] [--manifest FILE]\n\
+             \x20      {0} <n> --items\n\
+             \x20      {0} <n> --rowset HEX\n\
+             \x20      {0} <n> --mod8 [TOTAL]\n\
+             \x20      {0} --sum FILE...\n\
+             \x20 1 <= n <= 31\n\
+             \x20 --cuda        Run on a CUDA GPU (build with --features cuda)\n\
+             \x20 --device I    (CUDA mode only) CUDA device index (default 0)\n\
+             \x20 --prefix P    (CUDA mode only) Rows fixed per GPU ticket (default: the least that keeps the tables in flight within L2)\n\
+             \x20 --table-mem M (CUDA mode only) Device memory for tables per batch, MiB (default 8192)\n\
+             \x20 --blocks-per-sm B (CUDA mode only) Resident blocks per multiprocessor (default: as many as fit; fewer only for measurements)\n\
+             \x20 --stride S --phase P  Count only the row sets at positions P, P+S, P+2S, ... of the work list (phase P of S)\n\
+             \x20 --out FILE    Per-row-set counts, CSV (default rowsets_<n>[_s<S>_p<P>].csv; never overwritten)\n\
+             \x20 --manifest FILE  The run's manifest, JSON (default: the counts file with .json)\n\
+             \x20 --items       Print the number of work items and the work map fingerprint\n\
+             \x20 --rowset HEX  Count one row set on the CPU and print its record line (an audit of one line of the records)\n\
+             \x20 --mod8 [TOTAL]  Count the 180°-symmetric solutions S2; with TOTAL, check TOTAL ≡ S2 (mod 8)\n\
+             \x20 --sum FILE... Re-tabulate Q(n) from record files and check them (coverage, weights, phases, duplicates, mod 8)",
+            argv.first().map_or("pnqueens", String::as_str)
+        );
+        std::process::exit(2);
+    };
+    let mut args = Args {
+        n: 0,
+        mode: Mode::Count,
+        cuda: false,
+        device: 0,
+        prefix_depth: None,
+        table_mem_mib: 8192,
+        blocks_per_sm: None,
+        selection: Selection::ALL,
+        out: None,
+        manifest: None,
+    };
+    let mut n = None;
+    let mut modes = 0;
+    let mut rest = argv.iter().skip(1).peekable();
+    while let Some(arg) = rest.next() {
+        let mut value = |what: &str| -> String { rest.next().cloned().unwrap_or_else(|| { eprintln!("{what} needs a value"); usage() }) };
+        match arg.as_str() {
+            "--cuda" => args.cuda = true,
+            "--device" => args.device = value("--device").parse().unwrap_or_else(|_| usage()),
+            "--prefix" => args.prefix_depth = Some(value("--prefix").parse().unwrap_or_else(|_| usage())),
+            "--table-mem" => args.table_mem_mib = value("--table-mem").parse().unwrap_or_else(|_| usage()),
+            "--blocks-per-sm" => args.blocks_per_sm = Some(value("--blocks-per-sm").parse().unwrap_or_else(|_| usage())),
+            "--stride" => args.selection.stride = value("--stride").parse().unwrap_or_else(|_| usage()),
+            "--phase" => args.selection.phase = value("--phase").parse().unwrap_or_else(|_| usage()),
+            "--out" => args.out = Some(PathBuf::from(value("--out"))),
+            "--manifest" => args.manifest = Some(PathBuf::from(value("--manifest"))),
+            "--items" => {
+                args.mode = Mode::Items;
+                modes += 1;
+            }
+            "--rowset" => {
+                args.mode = Mode::RowSet(u32::from_str_radix(&value("--rowset"), 16).unwrap_or_else(|_| usage()));
+                modes += 1;
+            }
+            "--mod8" => {
+                // An optional total follows.
+                let total = rest.peek().and_then(|t| t.parse::<u128>().ok());
+                if total.is_some() {
+                    rest.next();
+                }
+                args.mode = Mode::Mod8(total);
+                modes += 1;
+            }
+            "--sum" => {
+                // Everything after --sum is a file name.
+                let files: Vec<String> = rest.by_ref().cloned().collect();
+                if files.is_empty() {
+                    usage();
+                }
+                args.mode = Mode::Sum(files);
+                modes += 1;
+            }
+            other => match other.parse::<u32>() {
+                Ok(v) if (1..=31).contains(&v) && n.is_none() => n = Some(v),
+                _ => usage(),
+            },
+        }
+    }
+    if modes > 1 || args.selection.stride == 0 || args.selection.phase >= args.selection.stride {
+        usage();
+    }
+    if matches!(args.mode, Mode::Sum(_)) {
+        if n.is_some() || args.cuda || args.out.is_some() {
+            usage();
+        }
+        return args;
+    }
+    args.n = n.unwrap_or_else(|| usage());
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,8 +700,54 @@ mod tests {
         for (i, &q) in KNOWN[..15].iter().enumerate() {
             let n = i as u32 + 1;
             let mut log = RowsetLog::discard(n);
-            count_queens(n, &mut log);
+            count_on_cpu(n, &work_items(n), &mut log);
             assert_eq!(log.total(), q, "Q({n})");
+        }
+    }
+
+    #[test]
+    fn phases_add_up_to_the_count() {
+        let n = 10;
+        let items = work_items(n);
+        let mut total = 0u128;
+        for phase in 0..7 {
+            let selected: Vec<RowSet> = (Selection { stride: 7, phase }).pick(&items).copied().collect();
+            let mut log = RowsetLog::discard(n);
+            count_on_cpu(n, &selected, &mut log);
+            total += log.total();
+        }
+        assert_eq!(total, KNOWN[n as usize - 1]);
+    }
+
+    #[test]
+    fn one_row_set_matches_a_direct_count() {
+        // Every row set's count, times its weight, is the number of solutions
+        // whose even-square queens lie in the row sets of its symmetry orbit.
+        // Checked on brute-force solutions for n = 8 and 9.
+        for n in [8u32, 9] {
+            let solutions = symmetric::brute_force_solutions(n);
+            let even_rows = |sol: &Vec<u32>| (0..n).filter(|&r| (r + sol[r as usize]).is_multiple_of(2)).fold(0u32, |m, r| m | 1 << r);
+            let by_row_set: BTreeMap<u32, u64> = solutions.iter().map(even_rows).fold(BTreeMap::new(), |mut m, mask| {
+                *m.entry(mask).or_default() += 1;
+                m
+            });
+            let mut covered = 0u64;
+            for row_set in feasible_row_sets(n) {
+                let orbit: std::collections::BTreeSet<u32> = [
+                    row_set.mask,
+                    work::reflect(n, row_set.mask),
+                    work::reflect(n, work::complement(n, row_set.mask)),
+                    work::complement(n, row_set.mask),
+                ]
+                .into_iter()
+                .filter(|&m| n.is_multiple_of(2) || m == row_set.mask || m == work::reflect(n, row_set.mask))
+                .collect();
+                let direct: u64 = orbit.iter().map(|m| by_row_set.get(m).copied().unwrap_or(0)).sum();
+                let counted = count_solutions(n, &row_set);
+                assert_eq!(u64::from(row_set.weight) * counted, direct, "n = {n}, row set {:08x}", row_set.mask);
+                covered += direct;
+            }
+            assert_eq!(covered, solutions.len() as u64);
         }
     }
 }

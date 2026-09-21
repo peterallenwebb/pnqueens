@@ -55,20 +55,53 @@ pub struct GpuOptions {
     pub blocks_per_sm: Option<u32>,
 }
 
-/// Q(n) computed on the GPU. Every row set's count is recorded in `log`
-/// (which keeps the weighted total) and the log is flushed after each batch.
-/// Prints progress per batch.
+/// What a GPU run has to say about itself: the device and the statistics of
+/// its launches, for the manifest.
 #[cfg(feature = "cuda")]
-pub fn count_queens_gpu(n: u32, opts: &GpuOptions, log: &mut crate::rowset_log::RowsetLog) -> Result<(), String> {
+pub struct RunStats {
+    pub gpu: String,
+    pub even: device::LaunchStats,
+    pub odd: device::LaunchStats,
+    pub join_seconds: f64,
+    pub max_entry: u32,
+}
+
+#[cfg(feature = "cuda")]
+impl RunStats {
+    pub fn to_json(&self) -> String {
+        let launch = |s: &device::LaunchStats| {
+            format!(
+                "{{\"seconds\": {:.3}, \"tickets\": {}, \"dead\": {}, \"steps\": {}, \"leaves\": {}, \"tallied\": {}}}",
+                s.seconds, s.tickets, s.dead, s.steps, s.leaves, s.tallied
+            )
+        };
+        format!(
+            "{{\"even\": {}, \"odd\": {}, \"join_seconds\": {:.3}, \"max_entry\": {}}}",
+            launch(&self.even),
+            launch(&self.odd),
+            self.join_seconds,
+            self.max_entry
+        )
+    }
+}
+
+/// The given row sets counted on the GPU. Every row set's count is recorded
+/// in `log` (which keeps the weighted total) and the log is flushed after
+/// each batch. Prints progress per batch.
+#[cfg(feature = "cuda")]
+pub fn count_queens_gpu(
+    n: u32,
+    opts: &GpuOptions,
+    items: &[crate::work::RowSet],
+    log: &mut crate::rowset_log::RowsetLog,
+) -> Result<RunStats, String> {
     use crate::rowset_log::RowsetCount;
     use device::{Gpu, LaunchStats};
     use std::time::Instant;
 
     let start = Instant::now();
-    let items = plan::work_items(n);
-    println!("PREPARED {}", items.len());
     let mut gpu = Gpu::new(n, opts, items.first())?;
-    let batches = plan::Batches::new(n, &items, gpu.prefix_depth(), gpu.budget_words())?;
+    let batches = plan::Batches::new(n, items, gpu.prefix_depth(), gpu.budget_words())?;
 
     let mut totals = [LaunchStats::default(), LaunchStats::default()]; // per colour, whole run
     let mut join_seconds = 0.0;
@@ -78,7 +111,7 @@ pub fn count_queens_gpu(n: u32, opts: &GpuOptions, log: &mut crate::rowset_log::
         // Record the batch's row sets; the flush makes them durable before
         // the next batch starts.
         for (item, &count) in batch.items.iter().zip(&result.counts) {
-            let r = RowsetCount { mask: item.mask, weight: item.weight as u32, count };
+            let r = RowsetCount { mask: item.mask, weight: item.weight, count };
             log.record(&r).map_err(|e| format!("cannot write row-set counts: {e}"))?;
         }
         log.flush().map_err(|e| format!("cannot write row-set counts: {e}"))?;
@@ -104,5 +137,5 @@ pub fn count_queens_gpu(n: u32, opts: &GpuOptions, log: &mut crate::rowset_log::
     println!("odd total:  {}", totals[1]);
     println!("join total: {join_seconds:.3}s");
     println!("largest table entry: {max_entry} (16-bit entries; every batch's tables matched the tallies)");
-    Ok(())
+    Ok(RunStats { gpu: gpu.name().to_string(), even: totals[0], odd: totals[1], join_seconds, max_entry })
 }

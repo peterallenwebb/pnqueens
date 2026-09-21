@@ -4,7 +4,8 @@
 //! search and table indexing, and their agreement with `plan`, against the
 //! known counts without a GPU. Timing and residency need the real thing.
 
-use super::plan::{table_entries, table_words, uses_mirror, work_items, Batches, COUNTER_LEAVES, COUNTER_TALLIED, COUNTER_TICKETS, N_COUNTERS};
+use super::plan::{table_entries, table_words, uses_mirror, Batches, COUNTER_LEAVES, COUNTER_TALLIED, COUNTER_TICKETS, N_COUNTERS};
+use crate::work::work_items;
 use crate::solution_table::{RANK_HI, RANK_LO};
 use crate::KNOWN;
 
@@ -73,7 +74,7 @@ fn count_by_emulation(n: u32, prefix_depth: u32, batch_tables: usize) -> u128 {
                 .zip(o)
                 .map(|(&e, &o)| u64::from(e & 0xFFFF) * u64::from(o & 0xFFFF) + u64::from(e >> 16) * u64::from(o >> 16))
                 .sum();
-            total += u128::from(item.weight as u32) * u128::from(count);
+            total += u128::from(item.weight) * u128::from(count);
         }
     }
     total

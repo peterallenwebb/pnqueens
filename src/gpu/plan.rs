@@ -6,7 +6,7 @@
 #![cfg_attr(not(feature = "cuda"), allow(dead_code))]
 
 use crate::solution_table::SolutionTable;
-use crate::{complement, get_feasible_even_row_combos, RowCombo};
+use crate::work::{complement, RowSet};
 
 /// Table entries are 16 bits, packed two to a 32-bit word (the kernel
 /// tallies with 32-bit atomics of the weight shifted into place); offsets
@@ -38,14 +38,6 @@ const TICKET_WINDOW_FACTOR: u64 = 3;
 /// table updates start missing. Measured on an RTX 5090 (cuda-notes.md 2.9):
 /// 15 MB of tables in flight runs at full speed, 30 MB does not.
 const L2_SHARE: (u64, u64) = (1, 4);
-
-/// The feasible even-queen row sets with their symmetry weights, heaviest
-/// table first, so that each batch holds items of similar size.
-pub fn work_items(n: u32) -> Vec<RowCombo> {
-    let mut items = get_feasible_even_row_combos(n);
-    items.sort_by_key(|item| std::cmp::Reverse(table_entries(n, item.mask)));
-    items
-}
 
 /// The shape of the two tables of the item with row set R, as (entries,
 /// odd stride). The E table of R on even squares and the O table of R̅ on
@@ -114,7 +106,7 @@ pub fn ticket_count(n: u32, rows: u32, parity: u32, prefix_depth: u32) -> u64 {
 /// at 36 warps per SM: 15 s at depth 4, 9 s at depth 5). Deeper prefixes
 /// cost decoding work for their many more, mostly dead, tickets, so the
 /// depth is no larger than this needs. The heaviest item stands for all.
-pub fn default_prefix_depth(n: u32, heaviest: &RowCombo, threads: u32, l2_bytes: u64) -> u32 {
+pub fn default_prefix_depth(n: u32, heaviest: &RowSet, threads: u32, l2_bytes: u64) -> u32 {
     let table_bytes = (table_words(table_entries(n, heaviest.mask)) * WORD_BYTES) as u64;
     let window = TICKET_WINDOW_FACTOR * u64::from(threads);
     let rows_bar = complement(n, heaviest.mask);
@@ -169,7 +161,7 @@ impl Launch {
 pub struct Batch<'a> {
     /// Position of the batch's first item in the full list, for progress messages.
     pub first: usize,
-    pub items: &'a [RowCombo],
+    pub items: &'a [RowSet],
     /// Per colour: [0] searches R on even squares, [1] searches R̅ on odd squares.
     pub launches: [Launch; 2],
     /// Table length of each item in words, for the join.
@@ -181,7 +173,7 @@ pub struct Batch<'a> {
 /// Cuts the sorted item list into batches that fit the table budget.
 pub struct Batches<'a> {
     n: u32,
-    items: &'a [RowCombo],
+    items: &'a [RowSet],
     next: usize,
     prefix_depth: u32,
     budget_words: usize,
@@ -189,7 +181,7 @@ pub struct Batches<'a> {
 
 impl<'a> Batches<'a> {
     /// `budget_words` is the table memory available per colour, in words.
-    pub fn new(n: u32, items: &'a [RowCombo], prefix_depth: u32, budget_words: usize) -> Result<Self, String> {
+    pub fn new(n: u32, items: &'a [RowSet], prefix_depth: u32, budget_words: usize) -> Result<Self, String> {
         let heaviest = items.iter().map(|item| table_words(table_entries(n, item.mask))).max().unwrap_or(0);
         if heaviest > budget_words {
             return Err(format!(
@@ -232,6 +224,7 @@ impl<'a> Iterator for Batches<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::work::work_items;
 
     #[test]
     fn ticket_count_is_the_product_of_prefix_radices() {

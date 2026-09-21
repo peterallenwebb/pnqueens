@@ -1,13 +1,15 @@
-//! Per-row-set results on disk.
+//! Per-row-set results on disk: the records of a computation.
 //!
 //! Q(n) is a sum over the feasible even-queen row sets R of
 //! weight(R) * count(R), where count(R) = sum over C of E[R, C] * O[R̅, C̅].
 //! Both the CPU and the GPU paths record every (R, weight, count) as it is
 //! produced, so a finished run can be re-summed, compared row set by row set
-//! with another run, or resumed by hand from what an interrupted run wrote.
+//! with another run, or audited one row set at a time (`--rowset`).
 //!
-//! The file is CSV with one header line and one line per row set:
+//! A file is CSV with a provenance line, a header line and one line per row
+//! set:
 //!
+//!     # pnqueens n=8 stride=1 phase=0 workmap=76f14ac1f9ff5e3b items=71 ...
 //!     n,rowset_hex,weight,count
 //!     8,0000000f,4,0
 //!
@@ -16,8 +18,11 @@
 //! count. Lines are written in the order results arrive and flushed when the
 //! caller asks (after each GPU batch), so an interrupted run keeps the row
 //! sets it finished. `n` is repeated on every line so files from different
-//! machines can be concatenated and checked together.
+//! machines can be concatenated and checked together. The provenance line
+//! holds `key=value` pairs (see `provenance_line` in main.rs); files from
+//! before it existed have none.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
@@ -47,11 +52,13 @@ pub struct RowsetLog {
 }
 
 impl RowsetLog {
-    /// A log to a new file. Refuses to overwrite an existing file: a finished
-    /// run's results should not be lost to a rerun with the same name.
-    pub fn create(path: &Path, n: u32) -> io::Result<Self> {
+    /// A log to a new file, headed by the provenance line. Refuses to
+    /// overwrite an existing file: a finished run's results should not be
+    /// lost to a rerun with the same name.
+    pub fn create(path: &Path, n: u32, provenance: &str) -> io::Result<Self> {
         let file = File::create_new(path)?;
         let mut log = Self::new(n, Box::new(BufWriter::new(file)));
+        writeln!(log.out, "# {provenance}")?;
         writeln!(log.out, "n,rowset_hex,weight,count")?;
         Ok(log)
     }
@@ -88,16 +95,36 @@ impl RowsetLog {
     }
 }
 
-/// Reads row-set results from one or more files written by `RowsetLog`.
-/// All lines must have the same n. Returns (n, rows).
-pub fn read_rowset_files(paths: &[String]) -> Result<(u32, Vec<RowsetCount>), String> {
+/// The `key=value` pairs of a file's provenance line.
+pub type Provenance = BTreeMap<String, String>;
+
+/// Everything read from one or more record files: n, the rows of all files
+/// in order, and each file's provenance (empty for a file without the line).
+pub struct Records {
+    pub n: u32,
+    pub rows: Vec<RowsetCount>,
+    pub provenance: Vec<(String, Provenance)>,
+}
+
+/// Reads record files written by `RowsetLog`. All lines must have the same n.
+pub fn read_rowset_files(paths: &[String]) -> Result<Records, String> {
     let mut n: Option<u32> = None;
     let mut rows = Vec::new();
+    let mut provenance = Vec::new();
     for path in paths {
         let file = File::open(path).map_err(|e| format!("{path}: {e}"))?;
+        let mut prov = Provenance::new();
         for (i, line) in BufReader::new(file).lines().enumerate() {
             let line = line.map_err(|e| format!("{path}: {e}"))?;
             let line = line.trim();
+            if let Some(rest) = line.strip_prefix('#') {
+                for pair in rest.split_whitespace() {
+                    if let Some((k, v)) = pair.split_once('=') {
+                        prov.insert(k.to_string(), v.to_string());
+                    }
+                }
+                continue;
+            }
             if line.is_empty() || line.starts_with("n,") {
                 continue; // header (or a blank line from concatenation)
             }
@@ -121,7 +148,8 @@ pub fn read_rowset_files(paths: &[String]) -> Result<(u32, Vec<RowsetCount>), St
             }
             rows.push(row);
         }
+        provenance.push((path.clone(), prov));
     }
     let n = n.ok_or("no row-set results found")?;
-    Ok((n, rows))
+    Ok(Records { n, rows, provenance })
 }

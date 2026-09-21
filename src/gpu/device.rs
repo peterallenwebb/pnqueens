@@ -7,7 +7,7 @@ use super::plan::{
 };
 use super::GpuOptions;
 use crate::solution_table::{RANK_HI, RANK_LO};
-use crate::RowCombo;
+use crate::work::RowSet;
 use cudarc::driver::sys::CUdevice_attribute::{
     CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
 };
@@ -86,6 +86,7 @@ fn cuda_err(e: impl std::fmt::Display) -> String {
 /// shape, and the buffers every batch reuses.
 pub struct Gpu {
     dev: Arc<CudaDevice>,
+    name: String,
     enumerate: CudaFunction,
     join: CudaFunction,
     /// Blocks and threads per block of an enumerate launch.
@@ -119,9 +120,10 @@ pub struct BatchResult {
 impl Gpu {
     /// Opens the device, chooses the prefix depth (from the heaviest item
     /// unless overridden), compiles the kernels and allocates the buffers.
-    pub fn new(n: u32, opts: &GpuOptions, heaviest: Option<&RowCombo>) -> Result<Self, String> {
+    pub fn new(n: u32, opts: &GpuOptions, heaviest: Option<&RowSet>) -> Result<Self, String> {
         let dev = CudaDevice::new(opts.device).map_err(cuda_err)?;
-        println!("device: CUDA {} ({})", opts.device, dev.name().map_err(cuda_err)?);
+        let name = dev.name().map_err(cuda_err)?;
+        println!("device: CUDA {} ({name})", opts.device);
 
         let prefix_depth = match (opts.prefix_depth, heaviest) {
             (Some(depth), _) => depth,
@@ -168,7 +170,11 @@ impl Gpu {
         let counters = dev.alloc_zeros(N_COUNTERS).map_err(cuda_err)?;
         let entry_sums = dev.alloc_zeros(2).map_err(cuda_err)?;
         let max_entry = dev.alloc_zeros(1).map_err(cuda_err)?;
-        Ok(Gpu { dev, enumerate, join, grid, block, prefix_depth, rank_lo, rank_hi, tables, budget_words, counters, entry_sums, max_entry })
+        Ok(Gpu { dev, name, enumerate, join, grid, block, prefix_depth, rank_lo, rank_hi, tables, budget_words, counters, entry_sums, max_entry })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn prefix_depth(&self) -> u32 {

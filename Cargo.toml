@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-gxhash = "3.5.0"
 rayon = "1.12.0"
+# SHA-256 of the binary itself, recorded with every run's results.
+sha2 = "0.10"
 # CUDA driver + NVRTC bindings for the optional GPU path (feature `cuda`).
 # The kernel is compiled at run time, so no CUDA toolkit is needed to build;
 # the machine that runs `--cuda` needs the NVIDIA driver and libnvrtc.

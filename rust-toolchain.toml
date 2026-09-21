@@ -1,0 +1,4 @@
+# Pinned so that every box builds the same binary from the same source.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
