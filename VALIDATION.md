@@ -40,7 +40,12 @@ over a million hazards at n = 12 before the two `__syncwarp` barriers in
 ## 3. Production counts
 
 Four checks apply to a finished count, all made by the binary itself from
-the records (`pnqueens --sum rowsets_*.csv`):
+the records (`pnqueens --sum rowsets_*.csv`). Every outcome is an exit
+status: 0 when the records are complete and every check passed, 1 when any
+check failed, 3 when the records are incomplete; `status.py` and
+`fleet.py status` propagate it, so a failed check cannot pass unnoticed
+through the tooling. A full count (`pnqueens N`) applies checks 2 and 3 to
+its own total and exits 1 on a failure; `--mod8 TOTAL` exits 1 on FAIL.
 
 1. **Coverage and weights.** Every feasible row set appears exactly once with
    its symmetry weight, or more than once with identical counts; a

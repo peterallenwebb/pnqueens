@@ -138,7 +138,7 @@ elif a.command == "status":
     everywhere(fleet, lambda b: ssh(b, f"last=$(tail -n 1 runs/{run}/logs/{b[2]}.log 2>/dev/null); "
                                        f"if kill -0 $(cat runs/worker_{run}.pid 2>/dev/null) 2>/dev/null; then echo -n 'ALIVE  '; "
                                        f"elif echo \"$last\" | grep -q finished; then echo -n 'DONE   '; else echo -n 'DEAD   '; fi; echo \"${{last:-(no log)}}\""))
-    subprocess.run([sys.executable, os.path.join(HERE, "status.py"), str(a.n), "--stride", str(a.stride)])
+    sys.exit(subprocess.run([sys.executable, os.path.join(HERE, "status.py"), str(a.n), "--stride", str(a.stride)]).returncode)
 elif a.command == "cmd":
     everywhere(fleet, lambda b: ssh(b, "cd pnqueens && " + " ".join(a.rest)))
 else:

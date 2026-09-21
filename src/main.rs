@@ -78,25 +78,41 @@ use std::path::PathBuf;
 use std::time::Instant;
 use work::{feasible_row_sets, fingerprint, work_items, RowSet, Selection};
 
+/// Exit status: 0 when every check that applied passed, 1 when one failed
+/// (`fail` and the checks below), 3 when records were incomplete.
+const EXIT_FAILED: i32 = 1;
+const EXIT_PARTIAL: i32 = 3;
+
 fn main() {
     let args = parse_args();
-    match &args.mode {
+    let code = match &args.mode {
         Mode::Count => count(&args),
         Mode::Version => {
             let id = Identity::of_this_run();
             println!("pnqueens commit {} binary {}", id.commit, id.binary_sha256);
+            0
         }
-        Mode::Items => print_items(args.n),
-        Mode::RowSet(mask) => audit_rowset(args.n, *mask),
-        Mode::Mod8(total) => mod8_check(args.n, *total),
+        Mode::Items => {
+            print_items(args.n);
+            0
+        }
+        Mode::RowSet(mask) => {
+            audit_rowset(args.n, *mask);
+            0
+        }
+        Mode::Mod8(total) => {
+            if mod8_check(args.n, *total) { 0 } else { EXIT_FAILED }
+        }
         Mode::Sum(files) => retabulate(files),
-    }
+    };
+    std::process::exit(code);
 }
 
 /// Q(n), or one phase of it: the selected row sets are counted, on the GPU
 /// or the CPU, into a record file headed by the run's provenance, and a JSON
-/// manifest describes the run.
-fn count(args: &Args) {
+/// manifest describes the run. A complete count is checked against the
+/// known value and the mod-8 identity; the exit status says whether it passed.
+fn count(args: &Args) -> i32 {
     let n = args.n;
     let start = Instant::now();
     let items = work_items(n);
@@ -119,11 +135,12 @@ fn count(args: &Args) {
     let device = if args.cuda { count_on_gpu(args, &selected, &mut log) } else { count_on_cpu(n, &selected, &mut log) };
     log.flush().unwrap_or_else(|e| fail(&format!("cannot write {}: {e}", out.display())));
     println!("{} row-set counts written to {}", log.written(), out.display());
-    if args.selection.is_all() {
-        report(n, log.total());
+    let passed = if args.selection.is_all() {
+        report(n, log.total()) & mod8_check(n, Some(log.total()))
     } else {
         println!("Q({n}) phase {} of {}: {} PARTIAL", args.selection.phase, args.selection.stride, log.total());
-    }
+        true
+    };
     let manifest = Manifest {
         n,
         selection: args.selection,
@@ -143,6 +160,7 @@ fn count(args: &Args) {
     };
     std::fs::write(&manifest_path, manifest.to_json()).unwrap_or_else(|e| fail(&format!("cannot write {}: {e}", manifest_path.display())));
     println!("manifest written to {}", manifest_path.display());
+    if passed { 0 } else { EXIT_FAILED }
 }
 
 /// `rowsets_<n>.csv`, or `rowsets_<n>_s<stride>_p<phase>.csv` for a phase.
@@ -274,21 +292,30 @@ fn audit_rowset(n: u32, mask: u32) {
 }
 
 /// The number of solutions fixed by the 180° rotation, and, given a total,
-/// whether Q ≡ S2 (mod 8) holds for it (see symmetric.rs).
-fn mod8_check(n: u32, total: Option<u128>) {
+/// whether Q ≡ S2 (mod 8) holds for it (see symmetric.rs). False on FAIL.
+fn mod8_check(n: u32, total: Option<u128>) -> bool {
     let start = Instant::now();
     let s2 = symmetric::rotation_fixed_solutions(n);
     match total {
-        Some(q) => println!("mod-8 check: {} (Q ≡ {}, S2 = {s2} ≡ {} mod 8, {:.1}s)", if q % 8 == u128::from(s2) % 8 { "PASS" } else { "FAIL" }, q % 8, s2 % 8, start.elapsed().as_secs_f64()),
-        None => println!("S2({n}) = {s2} ({:.1}s)", start.elapsed().as_secs_f64()),
+        Some(q) => {
+            let pass = q % 8 == u128::from(s2) % 8;
+            println!("mod-8 check: {} (Q ≡ {}, S2 = {s2} ≡ {} mod 8, {:.1}s)", if pass { "PASS" } else { "FAIL" }, q % 8, s2 % 8, start.elapsed().as_secs_f64());
+            pass
+        }
+        None => {
+            println!("S2({n}) = {s2} ({:.1}s)", start.elapsed().as_secs_f64());
+            true
+        }
     }
 }
 
 /// Re-tabulates Q(n) from record files and checks them: one work map across
 /// the files, the phases of a stride present, duplicate row sets in
 /// agreement, every feasible row set exactly once with the right weight, the
-/// total against the published value, and the mod-8 identity.
-fn retabulate(files: &[String]) {
+/// total against the published value, and the mod-8 identity. Returns the
+/// exit status: 0 when complete and every check passed, EXIT_PARTIAL when
+/// incomplete; a failed check exits EXIT_FAILED.
+fn retabulate(files: &[String]) -> i32 {
     let records = read_rowset_files(files).unwrap_or_else(|e| fail(&e));
     let n = records.n;
 
@@ -340,12 +367,11 @@ fn retabulate(files: &[String]) {
         files.len(),
         verified
     );
-    if complete {
-        report(n, total);
-        mod8_check(n, Some(total));
-    } else {
+    if !complete {
         println!("Q({n}): {total} PARTIAL");
+        return EXIT_PARTIAL;
     }
+    if report(n, total) & mod8_check(n, Some(total)) { 0 } else { EXIT_FAILED }
 }
 
 /// "3, 7-9, 12" for a sorted list.
@@ -364,16 +390,17 @@ fn summarize(xs: &[u32]) -> String {
 }
 
 /// Prints a complete count, labelled against the published value or the
-/// reference project's value when there is one.
-fn report(n: u32, total: u128) {
-    let status = match (known(n), reference(n)) {
-        (Some(k), _) if k == total => " ok",
-        (Some(_), _) => " MISMATCH",
-        (None, Some(r)) if r == total => " matches the reference project's value",
-        (None, Some(_)) => " DIFFERS from the reference project's value",
-        (None, None) => " (no reference value)",
+/// reference project's value when there is one. False when it differs.
+fn report(n: u32, total: u128) -> bool {
+    let (status, passed) = match (known(n), reference(n)) {
+        (Some(k), _) if k == total => (" ok", true),
+        (Some(_), _) => (" MISMATCH", false),
+        (None, Some(r)) if r == total => (" matches the reference project's value", true),
+        (None, Some(_)) => (" DIFFERS from the reference project's value", false),
+        (None, None) => (" (no reference value)", true),
     };
     println!("Q({n}): {total}{status}");
+    passed
 }
 
 /// Q(n) for 1 <= n <= 27, OEIS A000170. Used to label results and in tests.

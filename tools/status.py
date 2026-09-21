@@ -6,7 +6,9 @@ records (`pnqueens --sum`: coverage, weights, agreeing duplicates, total).
 
     status.py N --stride S [--dir runs] [--no-sync] [--binary B] [--key FILE]
 
-Syncs the records from the bucket first unless --no-sync.
+Syncs the records from the bucket first unless --no-sync. Exits non-zero
+when the binary's checks fail, or when it finds the records incomplete
+although no phase is missing.
 """
 import argparse, glob, json, os, re, subprocess, sys
 
@@ -50,4 +52,8 @@ csvs = [c for c in csvs if os.path.exists(c[:-4] + ".json")]
 if csvs:
     print("--- pnqueens --sum")
     sys.stdout.flush()
-    subprocess.run([a.binary, "--sum", *csvs])
+    code = subprocess.run([a.binary, "--sum", *csvs]).returncode
+    if code == 3 and missing:
+        code = 0                              # incomplete because phases are still to run
+    if code:
+        sys.exit(f"status: the records FAILED the binary's checks (exit {code})")

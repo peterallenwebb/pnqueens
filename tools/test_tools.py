@@ -28,6 +28,41 @@ def status():
                           capture_output=True, text=True, check=True).stdout
 
 
+def validation_exit_tests():
+    """A failed check must be an exit status: a corrupted complete record
+    (MISMATCH, mod-8 FAIL), a wrong --mod8 total, conflicting duplicates
+    through status.py, and incomplete records."""
+    d = os.path.join(tmp, "validation")
+    os.makedirs(d)
+    subprocess.run([binary, "8", "--out", os.path.join(d, "good.csv"), "--manifest", os.path.join(d, "good.json")], capture_output=True, check=True)
+    r = subprocess.run([binary, "--sum", os.path.join(d, "good.csv")], capture_output=True, text=True)
+    assert r.returncode == 0 and "Q(8): 92 ok" in r.stdout and "mod-8 check: PASS" in r.stdout, r.stdout
+    # One count altered: MISMATCH and mod-8 FAIL, exit 1.
+    lines = open(os.path.join(d, "good.csv")).read().splitlines()
+    i = next(i for i, l in enumerate(lines) if l.startswith("8,") and not l.endswith(",0"))
+    n_, mask, w, c = lines[i].split(",")
+    lines[i] = f"{n_},{mask},{w},{int(c) + 1}"
+    open(os.path.join(d, "bad.csv"), "w").write("\n".join(lines) + "\n")
+    r = subprocess.run([binary, "--sum", os.path.join(d, "bad.csv")], capture_output=True, text=True)
+    assert r.returncode == 1 and "MISMATCH" in r.stdout, (r.returncode, r.stdout)
+    # A wrong total for --mod8: exit 1.
+    r = subprocess.run([binary, "8", "--mod8", "93"], capture_output=True, text=True)
+    assert r.returncode == 1 and "FAIL" in r.stdout, (r.returncode, r.stdout)
+    # Incomplete records: exit 3.
+    open(os.path.join(d, "half.csv"), "w").write("\n".join(lines[: 2 + (len(lines) - 2) // 2]) + "\n")
+    r = subprocess.run([binary, "--sum", os.path.join(d, "half.csv")], capture_output=True, text=True)
+    assert r.returncode == 3 and "PARTIAL" in r.stdout, (r.returncode, r.stdout)
+    # Conflicting duplicates through status.py: exit non-zero.
+    rundir = os.path.join(tmp, "8_s1")
+    os.makedirs(rundir)
+    shutil.copy(os.path.join(d, "good.csv"), os.path.join(rundir, "rowsets_8_s1_p0.csv"))
+    shutil.copy(os.path.join(d, "good.json"), os.path.join(rundir, "rowsets_8_s1_p0.json"))
+    shutil.copy(os.path.join(d, "bad.csv"), os.path.join(rundir, "rowsets_8_s1_p0_verify.csv"))
+    shutil.copy(os.path.join(d, "good.json"), os.path.join(rundir, "rowsets_8_s1_p0_verify.json"))
+    r = subprocess.run([sys.executable, os.path.join(HERE, "status.py"), "8", "--stride", "1", "--dir", tmp, "--no-sync", "--binary", binary], capture_output=True, text=True)
+    assert r.returncode != 0 and "CONFLICT" in r.stdout + r.stderr, (r.returncode, r.stdout, r.stderr)
+
+
 def ship_tests():
     """ship.sh against a fake ssh that runs the remote script locally, with a
     fake cargo: a failing build must fail the ship even though an old
@@ -36,7 +71,7 @@ def ship_tests():
     clone = os.path.join(tmp, "clone")
     subprocess.run(["git", "clone", "-q", os.path.join(HERE, ".."), clone], check=True)
     shutil.copy(os.path.join(HERE, "ship.sh"), os.path.join(clone, "tools", "ship.sh"))
-    subprocess.run(["git", "-C", clone, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "test"], check=True)
+    subprocess.run(["git", "-C", clone, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qa", "--allow-empty", "-m", "test"], check=True)
     commit = subprocess.run(["git", "-C", clone, "rev-parse", "--short=12", "HEAD"], capture_output=True, text=True).stdout.strip()
     box = os.path.join(tmp, "box")
     fakebin = os.path.join(tmp, "fakebin")
@@ -101,6 +136,7 @@ try:
     r = worker("--phases", "0", "--redo", check=False)
     assert r.returncode != 0 and "REFUSED" in (r.stdout + r.stderr), r.stdout + r.stderr
     ship_tests()
+    validation_exit_tests()
     print("all tool tests passed")
 finally:
     shutil.rmtree(tmp)

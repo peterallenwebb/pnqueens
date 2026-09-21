@@ -119,6 +119,8 @@ a release").
   only when the item ordering does (test `fingerprints_are_stable`).
 - Every `fleet.py` command exits non-zero when any box fails its check
   (ship: the shipped commit and one hash; ladder: seven `ok`; racecheck:
-  zero hazards), so the checklist can be scripted and a step that fails
-  cannot be overlooked. `pnqueens --version` prints what a binary is.
+  zero hazards; status: the binary's checks of the records), and the binary
+  itself exits non-zero on a MISMATCH, a mod-8 FAIL or a CONFLICT, so the
+  checklist can be scripted and a step that fails cannot be overlooked.
+  `pnqueens --version` prints what a binary is.
 - Timing on shared boxes is contaminated by neighbours; counts are not.
