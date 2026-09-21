@@ -57,6 +57,7 @@ build of this repository (`cargo build --release`) for the checks.
 python3 tools/bucket_selftest.py                  # 0. bucket and key still fine
 python3 tools/fleet.py ship                       # 1. build the committed tree on every box (refuses a dirty tree); hashes must agree
 python3 tools/fleet.py ladder                     # 2. n = 16 … 22 on every box: every line "ok"
+python3 tools/fleet.py racecheck                  #    and the CUDA race detector on n = 10: "0 hazards" on every box
 python3 tools/fleet.py push-urls 27 --stride 120  # 3. sign the run's upload URLs and ship them
 python3 tools/fleet.py start 27 --stride 120      # 4. worker i of W on box i
 python3 tools/fleet.py status 27 --stride 120     # 5. hourly: liveness per box, sync, missing phases, the binary's checks, ETA

@@ -6,7 +6,7 @@ diagonally, so that Q(n) is a sum over row sets R of
 
     Σ_C E[R, C] · O[R̄, C̄]
 
-with E and O the numbers of one-colour partial solutions on given rows and
+with E and O the numbers of one-color partial solutions on given rows and
 columns (the derivation is the comment at the top of `src/main.rs`). Each row
 set is one bounded search whose leaves are tallied into a dense table, and
 the two tables of a row set are joined by a dot product. There is a CPU path
@@ -32,7 +32,7 @@ audited (VALIDATION.md), and a run can be spread over a fleet of GPU boxes
 
 ```
 cargo build --release                                  # CPU only
-cargo test --release                                   # the tests, under five seconds
+cargo test --release                                   # fast tests
 cargo test --release --features emulate                # plus the kernel emulated on the CPU (needs a C++ compiler)
 cargo build --release --features cuda                  # the GPU path (NVIDIA driver + libnvrtc at run time)
 

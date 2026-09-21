@@ -281,12 +281,19 @@ struct Stats {
  * whole placement are tallied here. Returns the mask of live pool slots,
  * or sets `exhausted` when the claimed tickets are past the end of the
  * work. `item` is the lane's last item, the starting point of the search
- * for the ticket's item. */
+ * for the ticket's item.
+ *
+ * The pool is shared memory written by one lane and read by another, and a
+ * warp vote orders execution but not memory (only __syncwarp does): the
+ * barrier on entry orders the previous pool's reads before its slots are
+ * overwritten, the one before the vote orders the new slots' writes before
+ * their reads. Every lane calls this, so the full-warp barriers are legal. */
 __device__ __forceinline__ u32 refill_pool(
     u64* counter, u64 total, u32 lane, u32 warp, u32 parity, u32& item, bool& exhausted, Stats& stats,
     const u32* item_rows, const u64* item_table, const u32* item_odd_stride, const u64* ticket_base, u32 n_items,
     u32* tables, const u16* rank_lo, const u16* rank_hi)
 {
+    __syncwarp();
     u64 base = 0;
     if (lane == 0u) base = atomicAdd(counter, (u64)POOL);
     base = __shfl_sync(FULL_WARP, base, 0);
@@ -317,6 +324,7 @@ __device__ __forceinline__ u32 refill_pool(
             live = true;
         }
     }
+    __syncwarp();
     return __ballot_sync(FULL_WARP, live);
 }
 

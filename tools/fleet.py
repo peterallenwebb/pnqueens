@@ -5,6 +5,7 @@ options such as an identity file come from PNQUEENS_SSH_OPTS.
 
     fleet.py ship                                   tools/ship.sh on every box; the binary hashes must agree
     fleet.py ladder                                 n = 16..22 on every box: every count ok
+    fleet.py racecheck                              the CUDA race detector on n = 10: zero hazards on every box
     fleet.py push-urls N --stride S [--tag T]       presign (unless the file exists) and ship the URLs
     fleet.py start N --stride S [-- worker options] worker i of W on box i
     fleet.py run-phases N --stride S --box LABEL --phases a,b,c [--tag T --redo] [-- binary options]
@@ -81,6 +82,10 @@ if a.command == "ship":
 elif a.command == "ladder":
     cmd = "cd pnqueens && d=$(mktemp -d) && for n in 16 17 18 19 20 21 22; do ./target/release/pnqueens $n --cuda --out $d/$n.csv 2>&1 | grep -E '^Q\\(|error'; done; rm -rf $d"
     everywhere(fleet, lambda b: ssh(b, cmd, timeout=600))
+elif a.command == "racecheck":
+    cmd = ("cd pnqueens && d=$(mktemp -d) && /usr/local/cuda/bin/compute-sanitizer --tool racecheck --racecheck-report hazard "
+           "./target/release/pnqueens 10 --cuda --table-mem 256 --out $d/10.csv 2>&1 | grep -E '^Q\\(|RACECHECK SUMMARY|error'; rm -rf $d")
+    everywhere(fleet, lambda b: ssh(b, cmd, timeout=1800))
 elif a.command == "push-urls":
     tag = f"_{a.tag}" if a.tag else ""
     env_file = os.path.join(ROOT, "push", f"urls_{run}{tag}.env")

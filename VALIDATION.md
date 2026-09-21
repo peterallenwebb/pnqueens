@@ -23,11 +23,19 @@ CPU, with nothing but this repository.
 CPU: resume, a replacement worker, a verification rerun, the refusal of a
 foreign work map, and the merged records passing `--sum`.
 
-## 2. The ladder
+## 2. The ladder and the race detector
 
 Every binary that produces a production count first runs `pnqueens N --cuda`
 for n = 16 … 22 on every box (`fleet.py ladder`) and must print `ok` (equal
-to OEIS) at every step.
+to OEIS) at every step, and runs under the CUDA race detector at n = 10
+(`fleet.py racecheck`: `compute-sanitizer --tool racecheck`), which must
+report zero hazards. The detector targets what neither the counts nor the
+kernel's tally check can: shared memory written by one lane and read by
+another without the ordering the memory model requires. The warp's prefix
+pool is such a channel, and a review in September 2026 found it relied on a
+warp vote for ordering, which votes do not provide; the detector reported
+over a million hazards at n = 12 before the two `__syncwarp` barriers in
+`refill_pool` and none after (`cuda-notes.md`, 2.11).
 
 ## 3. Production counts
 

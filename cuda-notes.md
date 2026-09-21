@@ -366,6 +366,25 @@ divergence (13 of 32 lanes active per instruction), the leaf's
 `table_index`, and the power limit. (No profiler on this container box:
 ERR_NVGPUCTRPERM, as in the earlier ones.)
 
+### 2.11 The pool's missing barriers (2026-09-21)
+
+An outside review found that the warp's prefix pool (2.9) was written by one
+lane and read by another with only `__ballot_sync` between them. A warp
+vote orders execution, not memory; only `__syncwarp` (`bar.warp.sync`)
+guarantees that lanes see each other's shared-memory stores. It had never
+produced a wrong count, because a converged warp executes in lockstep and
+shared memory is coherent within the SM, but the compiler was free to move
+the stores past the vote. `compute-sanitizer --tool racecheck` made the
+defect visible: 15,576 warp-level RAW hazards at n = 8, 159,324 at n = 10,
+1,326,204 at n = 12, all on the pool. Two `__syncwarp()` in `refill_pool`
+(on entry, ordering the previous pool's reads before its reuse; before the
+vote, ordering the stores before the reads) bring that to zero at no
+measurable cost. Racecheck cannot run on a large n (it instruments every
+shared-memory access of a persistent kernel: n = 14 did not finish in half
+an hour), so the checklist uses n = 10. The kernel's tally check cannot see
+this class of error, since a search on a corrupted prefix tallies
+consistently with itself, and the one-lane emulator has no races at all.
+
 ## 3. Things that did not work (keep for reviewers)
 
 - 4-deep software-pipelined read queue: slightly worse than no queue

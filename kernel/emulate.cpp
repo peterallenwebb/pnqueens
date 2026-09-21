@@ -28,6 +28,7 @@ static inline unsigned __funnelshift_r(unsigned lo, unsigned hi, unsigned s) { s
 /* Warp intrinsics for a warp of one lane (lane 0). */
 template <class T> static T __shfl_sync(unsigned, T v, unsigned) { return v; }
 static inline unsigned __ballot_sync(unsigned, bool pred) { return pred ? 1u : 0u; }
+static inline void __syncwarp(unsigned = 0xffffffffu) {}
 static inline unsigned __fns(unsigned mask, unsigned base, int offset) {   /* position of the offset-th set bit at or after base */
     for (unsigned i = base; i < 32; ++i) if ((mask >> i) & 1u && --offset == 0) return i;
     return 0xffffffffu;
