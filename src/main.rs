@@ -82,6 +82,10 @@ fn main() {
     let args = parse_args();
     match &args.mode {
         Mode::Count => count(&args),
+        Mode::Version => {
+            let id = Identity::of_this_run();
+            println!("pnqueens commit {} binary {}", id.commit, id.binary_sha256);
+        }
         Mode::Items => print_items(args.n),
         Mode::RowSet(mask) => audit_rowset(args.n, *mask),
         Mode::Mod8(total) => mod8_check(args.n, *total),
@@ -557,6 +561,8 @@ fn enumerate(n: u32, rows: u32, parity: u32, first_row_columns: u32, mut leaf: i
 enum Mode {
     /// Count the selected row sets (the default).
     Count,
+    /// `--version`: the commit the binary was built from and its SHA-256.
+    Version,
     /// `--items`: the item count and work map fingerprint.
     Items,
     /// `--rowset HEX`: one row set on the CPU.
@@ -601,6 +607,7 @@ fn parse_args() -> Args {
              \x20      {0} <n> --rowset HEX\n\
              \x20      {0} <n> --mod8 [TOTAL]\n\
              \x20      {0} --sum FILE...\n\
+             \x20      {0} --version\n\
              \x20 1 <= n <= 31\n\
              \x20 --cuda        Run on a CUDA GPU (build with --features cuda)\n\
              \x20 --device I    (CUDA mode only) CUDA device index (default 0)\n\
@@ -611,6 +618,7 @@ fn parse_args() -> Args {
              \x20 --out FILE    Per-row-set counts, CSV (default rowsets_<n>[_s<S>_p<P>].csv; never overwritten)\n\
              \x20 --manifest FILE  The run's manifest, JSON (default: the counts file with .json)\n\
              \x20 --items       Print the number of work items and the work map fingerprint\n\
+             \x20 --version     Print the source commit the binary was built from and its SHA-256\n\
              \x20 --rowset HEX  Count one row set on the CPU and print its record line (an audit of one line of the records)\n\
              \x20 --mod8 [TOTAL]  Count the 180°-symmetric solutions S2; with TOTAL, check TOTAL ≡ S2 (mod 8)\n\
              \x20 --sum FILE... Re-tabulate Q(n) from record files and check them (coverage, weights, phases, duplicates, mod 8)",
@@ -649,6 +657,10 @@ fn parse_args() -> Args {
                 args.mode = Mode::Items;
                 modes += 1;
             }
+            "--version" => {
+                args.mode = Mode::Version;
+                modes += 1;
+            }
             "--rowset" => {
                 args.mode = Mode::RowSet(u32::from_str_radix(&value("--rowset"), 16).unwrap_or_else(|_| usage()));
                 modes += 1;
@@ -680,7 +692,7 @@ fn parse_args() -> Args {
     if modes > 1 || args.selection.stride == 0 || args.selection.phase >= args.selection.stride {
         usage();
     }
-    if matches!(args.mode, Mode::Sum(_)) {
+    if matches!(args.mode, Mode::Sum(_) | Mode::Version) {
         if n.is_some() || args.cuda || args.out.is_some() {
             usage();
         }

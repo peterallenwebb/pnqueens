@@ -55,7 +55,7 @@ build of this repository (`cargo build --release`) for the checks.
 
 ```
 python3 tools/bucket_selftest.py                  # 0. bucket and key still fine
-python3 tools/fleet.py ship                       # 1. build the committed tree on every box (refuses a dirty tree); hashes must agree
+python3 tools/fleet.py ship                       # 1. build the committed tree on every box (refuses a dirty tree; fails unless every box reports HEAD and one binary hash)
 python3 tools/fleet.py ladder                     # 2. n = 16 … 22 on every box: every line "ok"
 python3 tools/fleet.py racecheck                  #    and the CUDA race detector on n = 10: "0 hazards" on every box
 python3 tools/fleet.py push-urls 27 --stride 120  # 3. sign the run's upload URLs and ship them
@@ -117,4 +117,8 @@ a release").
   another fingerprint refuses to start against the run's manifest, and
   `--sum` refuses files with different fingerprints. The fingerprint changes
   only when the item ordering does (test `fingerprints_are_stable`).
+- Every `fleet.py` command exits non-zero when any box fails its check
+  (ship: the shipped commit and one hash; ladder: seven `ok`; racecheck:
+  zero hazards), so the checklist can be scripted and a step that fails
+  cannot be overlooked. `pnqueens --version` prints what a binary is.
 - Timing on shared boxes is contaminated by neighbours; counts are not.

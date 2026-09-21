@@ -3,7 +3,7 @@
 per line; labels default to box01, box02, ...), in parallel over ssh. ssh
 options such as an identity file come from PNQUEENS_SSH_OPTS.
 
-    fleet.py ship                                   tools/ship.sh on every box; the binary hashes must agree
+    fleet.py ship                                   tools/ship.sh on every box; one commit and one binary hash, or it fails
     fleet.py ladder                                 n = 16..22 on every box: every count ok
     fleet.py racecheck                              the CUDA race detector on n = 10: zero hazards on every box
     fleet.py push-urls N --stride S [--tag T]       presign (unless the file exists) and ship the URLs
@@ -43,14 +43,27 @@ def scp(box, src, dst):
     return subprocess.run(["scp", "-P", port, *SSH_OPTS, src, f"{host}:{dst}"], capture_output=True, text=True).returncode == 0
 
 
-def everywhere(fleet, fn):
+def everywhere(fleet, fn, require=None):
+    """Runs fn on every box in parallel and prints the results. Exits non-zero
+    if any box failed or, given `require`, if its output fails that check;
+    returns the outputs by label otherwise."""
+    results = {}
+    failed = []
     with ThreadPoolExecutor(len(fleet)) as pool:
         for label, code, out in pool.map(fn, fleet):
             for line in out.splitlines() or ["(no output)"]:
                 print(f"{label}: {line}")
+            results[label] = out
             if code:
                 print(f"{label}: EXIT {code}")
+                failed.append(label)
+            elif require and not require(out):
+                print(f"{label}: FAILED the check")
+                failed.append(label)
     sys.stdout.flush()
+    if failed:
+        sys.exit(f"{a.command}: failed on {', '.join(failed)}")
+    return results
 
 
 ap = argparse.ArgumentParser()
@@ -78,14 +91,24 @@ if a.command == "ship":
         port, host, label = box
         r = subprocess.run(["sh", os.path.join(HERE, "ship.sh"), port, host], capture_output=True, text=True)
         return label, r.returncode, (r.stdout + (r.stderr if r.returncode else "")).strip()
-    everywhere(fleet, ship)
+    results = everywhere(fleet, ship, require=lambda out: " commit " in out and " binary " in out)
+    # One source commit and one binary on the whole fleet.
+    commits = {out.split(" commit ")[1].split()[0] for out in results.values()}
+    hashes = {out.split(" binary ")[1].split()[0] for out in results.values()}
+    head = subprocess.run(["git", "rev-parse", "--short=12", "HEAD"], capture_output=True, text=True, cwd=ROOT).stdout.strip()
+    if commits != {head}:
+        sys.exit(f"ship: the boxes report commits {sorted(commits)}, HEAD is {head}")
+    if len(hashes) != 1:
+        sys.exit(f"ship: the boxes built different binaries: {sorted(hashes)}")
+    print(f"fleet: {len(results)} boxes, commit {head}, binary {hashes.pop()}")
 elif a.command == "ladder":
-    cmd = "cd pnqueens && d=$(mktemp -d) && for n in 16 17 18 19 20 21 22; do ./target/release/pnqueens $n --cuda --out $d/$n.csv 2>&1 | grep -E '^Q\\(|error'; done; rm -rf $d"
-    everywhere(fleet, lambda b: ssh(b, cmd, timeout=600))
+    ns = [16, 17, 18, 19, 20, 21, 22]
+    cmd = f"cd pnqueens && d=$(mktemp -d) && for n in {' '.join(map(str, ns))}; do ./target/release/pnqueens $n --cuda --out $d/$n.csv 2>&1 | grep -E '^Q\\(|error'; done; rm -rf $d"
+    everywhere(fleet, lambda b: ssh(b, cmd, timeout=600), require=lambda out: sum(line.endswith(" ok") for line in out.splitlines()) == len(ns))
 elif a.command == "racecheck":
     cmd = ("cd pnqueens && d=$(mktemp -d) && /usr/local/cuda/bin/compute-sanitizer --tool racecheck --racecheck-report hazard "
            "./target/release/pnqueens 10 --cuda --table-mem 256 --out $d/10.csv 2>&1 | grep -E '^Q\\(|RACECHECK SUMMARY|error'; rm -rf $d")
-    everywhere(fleet, lambda b: ssh(b, cmd, timeout=1800))
+    everywhere(fleet, lambda b: ssh(b, cmd, timeout=1800), require=lambda out: "0 hazards displayed (0 errors, 0 warnings)" in out and "Q(10): 724 ok" in out)
 elif a.command == "push-urls":
     tag = f"_{a.tag}" if a.tag else ""
     env_file = os.path.join(ROOT, "push", f"urls_{run}{tag}.env")
