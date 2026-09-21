@@ -77,21 +77,41 @@ def bucket_settings(token, bucket):
 
 
 def list_objects(token, bucket, prefix):
-    """The names and sizes of the objects under `prefix`."""
+    """The objects under `prefix`: (name, size, md5) with md5 as the bucket
+    reports it (base64 of the MD5 digest)."""
     out, page = [], None
     while True:
-        q = {"prefix": prefix, "fields": "items(name,size),nextPageToken", "maxResults": "1000"}
+        q = {"prefix": prefix, "fields": "items(name,size,md5Hash),nextPageToken", "maxResults": "1000"}
         if page:
             q["pageToken"] = page
         data = json.loads(api_get(token, f"{STORAGE}/storage/v1/b/{bucket}/o?" + urllib.parse.urlencode(q)))
-        out += [(o["name"], int(o["size"])) for o in data.get("items", [])]
+        out += [(o["name"], int(o["size"]), o.get("md5Hash", "")) for o in data.get("items", [])]
         page = data.get("nextPageToken")
         if not page:
             return out
 
 
-def download(token, bucket, obj, path):
+def md5_of(data):
+    """MD5 of bytes, as the bucket reports it."""
+    return base64.b64encode(hashlib.md5(data).digest()).decode()
+
+
+def needs_fetch(path, md5):
+    """Whether the local copy at `path` is missing or differs from the
+    object with the given MD5. Size is not enough: a rerun that changes a
+    count changes bytes, not the length."""
+    if not os.path.exists(path):
+        return True
+    with open(path, "rb") as f:
+        return md5_of(f.read()) != md5
+
+
+def download(token, bucket, obj, path, md5):
+    """Downloads an object, checks its MD5 against the listing, and only then
+    puts it in place. Returns its size."""
     data = api_get(token, f"{STORAGE}/storage/v1/b/{bucket}/o/{urllib.parse.quote(obj, safe='')}?alt=media")
+    if md5 and md5_of(data) != md5:
+        raise IOError(f"{obj}: downloaded contents do not match the bucket's MD5")
     tmp = path + ".part"
     with open(tmp, "wb") as f:
         f.write(data)

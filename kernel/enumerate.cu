@@ -305,7 +305,7 @@ __device__ __forceinline__ u32 refill_pool(
         item = find_item(ticket_base, n_items, item, t);
         const u32 rows = item_rows[item], odd_stride = item_odd_stride[item];
         const u64 table = item_table[item];
-        const Prefix p = decode_prefix((u32)(t - ticket_base[item]), rows, parity);
+        const Prefix p = decode_prefix((u32)(t - ticket_base[item]), rows, parity);   /* < 2^32: the plan refuses more per item */
         if (p.dead) {
             ++stats.dead;
         } else if (p.rest == 0u) {             /* the prefix is the whole placement (also |R| = 0) */

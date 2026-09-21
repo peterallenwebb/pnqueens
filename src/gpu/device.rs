@@ -3,7 +3,7 @@
 
 use super::plan::{
     default_prefix_depth, uses_mirror, Batch, Launch, COUNTER_DEAD, COUNTER_LEAVES, COUNTER_STEPS, COUNTER_TALLIED, COUNTER_TICKETS,
-    MIN_PREFIX_DEPTH, N_COUNTERS, WORD_BYTES,
+    MAX_TICKETS_PER_ITEM, MIN_PREFIX_DEPTH, N_COUNTERS, WORD_BYTES,
 };
 use super::GpuOptions;
 use crate::solution_table::{RANK_HI, RANK_LO};
@@ -141,10 +141,11 @@ impl Gpu {
         if prefix_depth == 0 {
             return Err("prefix depth must be at least 1".into());
         }
-        // The kernel decodes a ticket's position within its item in 32 bits.
-        let max_tickets = u64::from(n.div_ceil(2)).pow(prefix_depth);
-        if max_tickets > u64::from(u32::MAX) {
-            return Err(format!("prefix depth {prefix_depth} gives up to {max_tickets} tickets per row set; the limit is 2^32"));
+        // An early form of the plan's check that no item has more tickets
+        // than the kernel can number (the plan checks the real counts).
+        let bound = u64::from(n.div_ceil(2)).checked_pow(prefix_depth).unwrap_or(u64::MAX);
+        if bound > MAX_TICKETS_PER_ITEM {
+            return Err(format!("prefix depth {prefix_depth} gives up to {bound} tickets per row set; the limit is 2^32 - 1"));
         }
 
         let (block, frames) = (BLOCK, frames(n, prefix_depth));

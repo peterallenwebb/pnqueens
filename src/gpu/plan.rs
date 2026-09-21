@@ -64,12 +64,17 @@ pub fn uses_mirror(n: u32) -> bool {
     n % 2 == 1 && n >= 3
 }
 
+/// The most tickets one item may have: the kernel decodes a ticket's
+/// position within its item in 32 bits.
+pub const MAX_TICKETS_PER_ITEM: u64 = u32::MAX as u64;
+
 /// Number of tickets for one search: the product, over the first
 /// `prefix_depth` rows of `rows`, of the number of columns the ticket digit
 /// for that row ranges over. That is the colour-compatible columns of the
 /// row, except that with the mirror symmetry the first row of an odd-square
 /// search is limited to the columns up to the centre. This must match the
-/// kernel's `digit_radix` exactly.
+/// kernel's `take_digit` exactly. Saturates at u64::MAX instead of wrapping,
+/// so an absurd depth compares as too many tickets, never as few.
 pub fn ticket_count(n: u32, rows: u32, parity: u32, prefix_depth: u32) -> u64 {
     let (m_even, m_odd) = (n.div_ceil(2), n / 2);
     let mid = (n - 1) / 2;
@@ -87,7 +92,7 @@ pub fn ticket_count(n: u32, rows: u32, parity: u32, prefix_depth: u32) -> u64 {
         } else {
             m_odd
         };
-        count *= u64::from(radix);
+        count = count.saturating_mul(u64::from(radix));
         taken += 1;
     }
     count
@@ -115,7 +120,7 @@ pub fn default_prefix_depth(n: u32, heaviest: &RowSet, threads: u32, l2_bytes: u
         let tickets = ticket_count(n, heaviest.mask, 0, depth).min(ticket_count(n, rows_bar, 1, depth));
         let items_in_flight = window.div_ceil(tickets.max(1));
         let next = ticket_count(n, heaviest.mask, 0, depth + 1).max(ticket_count(n, rows_bar, 1, depth + 1));
-        let deeper_is_allowed = depth < n && next <= u64::from(u32::MAX);
+        let deeper_is_allowed = depth < n && next <= MAX_TICKETS_PER_ITEM;
         // Stop when the tables fit, or when going deeper cannot help: one
         // item in flight is the least possible.
         if items_in_flight * table_bytes <= l2_bytes * L2_SHARE.0 / L2_SHARE.1 || items_in_flight <= 1 || !deeper_is_allowed {
@@ -181,6 +186,8 @@ pub struct Batches<'a> {
 
 impl<'a> Batches<'a> {
     /// `budget_words` is the table memory available per colour, in words.
+    /// Refuses a prefix depth that gives any item, on either colour, more
+    /// tickets than the kernel can number.
     pub fn new(n: u32, items: &'a [RowSet], prefix_depth: u32, budget_words: usize) -> Result<Self, String> {
         let heaviest = items.iter().map(|item| table_words(table_entries(n, item.mask))).max().unwrap_or(0);
         if heaviest > budget_words {
@@ -188,6 +195,14 @@ impl<'a> Batches<'a> {
                 "table budget of {} MiB is too small for one pair of tables of {heaviest} words",
                 (2 * budget_words * WORD_BYTES) >> 20
             ));
+        }
+        let most_tickets = items
+            .iter()
+            .map(|item| ticket_count(n, item.mask, 0, prefix_depth).max(ticket_count(n, complement(n, item.mask), 1, prefix_depth)))
+            .max()
+            .unwrap_or(0);
+        if most_tickets > MAX_TICKETS_PER_ITEM {
+            return Err(format!("prefix depth {prefix_depth} gives up to {most_tickets} tickets for one row set; the limit is 2^32 - 1"));
         }
         Ok(Batches { n, items, next: 0, prefix_depth, budget_words })
     }
@@ -247,6 +262,18 @@ mod tests {
         assert_eq!(ticket_count(8, 0b11001, 1, 3), 4 * 4 * 4);
         // No rows: a single ticket.
         assert_eq!(ticket_count(7, 0, 0, 3), 1);
+    }
+
+    #[test]
+    fn too_many_tickets_are_refused_not_wrapped() {
+        // n = 31, all rows: 16 even columns per even row, 15 per odd row;
+        // 30 digits overflow u64 and must saturate, and any depth that gives
+        // an item more than 2^32 - 1 tickets is refused by the plan.
+        assert_eq!(ticket_count(31, 0x7fff_ffff, 0, 30), u64::MAX);
+        let items = [RowSet { mask: 0x7fff_ffff, weight: 1 }];
+        assert!(Batches::new(31, &items, 7, usize::MAX / 8).is_ok(), "16^4 * 15^3 tickets fit");
+        assert!(Batches::new(31, &items, 9, usize::MAX / 8).is_err(), "16^5 * 15^4 tickets do not");
+        assert!(Batches::new(31, &items, 64, usize::MAX / 8).is_err(), "an absurd depth is refused");
     }
 
     #[test]

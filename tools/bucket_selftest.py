@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Checks the records bucket and the signing key before a run: the bucket's
 settings (versioning on, public access prevented), a signed PUT of a small
-object, its read-back through the API, and its listing.
+object, its read-back through the API, its listing, and that overwriting
+it with different contents of the same length is seen by the sync.
 
     bucket_selftest.py [--bucket B] [--key FILE]
 """
@@ -35,19 +36,36 @@ with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
     f.write(body)
     path = f.name
 ok, msg = gcs.curl_put(gcs.sign_url(key, a.bucket, obj, expires=600), path)
-os.unlink(path)
 print(f"signed PUT of {obj}: {'ok' if ok else 'FAILED ' + msg}")
 if not ok:
+    os.unlink(path)
     problems.append("the signed upload failed")
 else:
     back = gcs.api_get(token, f"{gcs.STORAGE}/storage/v1/b/{a.bucket}/o/{obj.replace('/', '%2F')}?alt=media").decode()
     print(f"read-back: {'ok' if back == body else 'MISMATCH'}")
     if back != body:
         problems.append("the object read back differs")
-    listed = [n for n, _ in gcs.list_objects(token, a.bucket, "selftest/")]
+    listed = {n: md5 for n, _, md5 in gcs.list_objects(token, a.bucket, "selftest/")}
     print(f"listing: {len(listed)} self-test objects{', includes it' if obj in listed else ', DOES NOT include it'}")
     if obj not in listed:
         problems.append("the listing does not show the uploaded object")
+    else:
+        # The sync's test: a local copy, then the object overwritten with
+        # different contents of the same length, must be fetched again.
+        local = os.path.join(tempfile.mkdtemp(), "obj")
+        gcs.download(token, a.bucket, obj, local, listed[obj])
+        same_after = gcs.needs_fetch(local, listed[obj])
+        body2 = body[:-2] + "X\n"
+        with open(path, "w") as f:
+            f.write(body2)
+        ok2, msg2 = gcs.curl_put(gcs.sign_url(key, a.bucket, obj, expires=600), path)
+        os.unlink(path)
+        md5_2 = {n: md5 for n, _, md5 in gcs.list_objects(token, a.bucket, "selftest/")}.get(obj)
+        changed = ok2 and gcs.needs_fetch(local, md5_2)
+        print(f"same-length overwrite seen by the sync: {'ok' if not same_after and changed else 'FAILED'}")
+        if same_after or not changed:
+            problems.append("the sync would keep a stale copy after a same-length overwrite")
+        os.unlink(local)
 for p in problems:
     print("PROBLEM:", p)
 sys.exit(1 if problems else 0)
