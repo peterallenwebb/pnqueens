@@ -89,6 +89,17 @@ into its neighbour and changed the sum, so every batch of every run is
 proven free of overflow (the largest entries seen are 291 at n = 22, 982 at
 n = 24, at most 2,224 at n = 25, measured as a bound). Per-row-set counts are u64, totals u128.
 
+**Q(28) = 2,564,269,152,506,723,832** (2026-09-22, eleven RTX 5090 boxes,
+stride 600, binary source commit eedf00645cfd, 124.7 GPU-hours) passed the
+whole chain: 600 of 600 phases, every one of the 10,034,104 row sets
+recorded once with its weight, twelve phases (200,682 row sets) recomputed
+at prefix depth 7 and 4 blocks per SM in exact agreement with the main run's
+depth 6 and 8 blocks, mod-8 PASS with S₂ = 1,250,901,440, and equality with
+the reference project's value, computed by a different program. The
+rehearsals Q(24) … Q(27) reproduced the published values on the same fleet
+with the same binary. The release is `rowsets_28.csv` (10,034,104 lines,
+sorted by row set), the 612 phase manifests, and their SHA-256 sums.
+
 ## 4. Auditing a release
 
 A release is the merged CSV of every row set of a count, its manifests, and

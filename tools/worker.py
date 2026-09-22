@@ -41,8 +41,10 @@ ap.add_argument("--dir", default=os.path.expanduser("~/runs"))
 ap.add_argument("--push-env", help="signed URLs (default DIR/push_urls[_TAG].env when present)")
 ap.add_argument("--retries", type=int, default=2)
 ap.add_argument("--cpu", action="store_true", help="count on the CPU (tests)")
-ap.add_argument("extra", nargs="*", help="options passed to the binary, after --")
-a = ap.parse_args()
+a, extra = ap.parse_known_args()
+# Everything after `--` (or anything unrecognized) goes to the binary: the
+# alternate configuration of a verification rerun.
+a.extra = [x for x in extra if x != "--"]
 
 # Our own process group, so that killing it (fleet.py stop) also stops the
 # phase's binary.
