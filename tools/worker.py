@@ -44,6 +44,13 @@ ap.add_argument("--cpu", action="store_true", help="count on the CPU (tests)")
 ap.add_argument("extra", nargs="*", help="options passed to the binary, after --")
 a = ap.parse_args()
 
+# Our own process group, so that killing it (fleet.py stop) also stops the
+# phase's binary.
+try:
+    os.setsid()
+except OSError:
+    pass
+
 run = f"{a.n}_s{a.stride}"
 tag = f"_{a.tag}" if a.tag else ""
 rundir = os.path.join(a.dir, run)

@@ -72,11 +72,15 @@ its own total and exits 1 on a failure; `--mod8 TOTAL` exits 1 on FAIL.
    record the effective configuration, and `status.py` warns when a
    duplicate ran in the same one as the original.
 
-**Provenance.** Every record file carries the source commit (the build
-refuses to ship a dirty tree, so it is the commit that was built), the
+**Provenance.** Every record file carries the binary's source commit, the
 SHA-256 of the binary, the host, the device, the options, and the work-map
 fingerprint; every phase's manifest adds the launch statistics, the largest
-table entry and the wall time.
+table entry and the wall time. The source commit is the last commit that
+touched what the binary is built from (`src`, `kernel`, the Cargo files,
+`build.rs`, the toolchain pin), so commits to tools or documents leave the
+binary, its hash and its recorded commit unchanged, and the binary
+rehearsed is provably the binary of the production run; the ship step
+refuses a dirty tree, so the tools and documents on a box are a commit too.
 
 **The kernel's own check.** Table entries are 16 bits, two to a word. The
 join sums the entries of each colour and the host requires the sum to equal

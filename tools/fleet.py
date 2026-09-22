@@ -9,7 +9,7 @@ options such as an identity file come from PNQUEENS_SSH_OPTS.
     fleet.py push-urls N --stride S [--tag T]       presign (unless the file exists) and ship the URLs
     fleet.py start N --stride S [-- worker options] worker i of W on box i
     fleet.py run-phases N --stride S --box LABEL --phases a,b,c [--tag T --redo] [-- binary options]
-    fleet.py stop N --stride S                      kill the workers
+    fleet.py stop N --stride S                      kill the workers and the phases they are running
     fleet.py status N --stride S                    liveness per box, then status.py
     fleet.py cmd 'shell command'                    on every box, in the checkout
 """
@@ -92,12 +92,14 @@ if a.command == "ship":
         r = subprocess.run(["sh", os.path.join(HERE, "ship.sh"), port, host], capture_output=True, text=True)
         return label, r.returncode, (r.stdout + (r.stderr if r.returncode else "")).strip()
     results = everywhere(fleet, ship, require=lambda out: " commit " in out and " binary " in out)
-    # One source commit and one binary on the whole fleet.
+    # One source commit (the last that touched the binary's sources, as
+    # build.rs and ship.sh compute it) and one binary on the whole fleet.
     commits = {out.split(" commit ")[1].split()[0] for out in results.values()}
     hashes = {out.split(" binary ")[1].split()[0] for out in results.values()}
-    head = subprocess.run(["git", "rev-parse", "--short=12", "HEAD"], capture_output=True, text=True, cwd=ROOT).stdout.strip()
+    head = subprocess.run(["git", "log", "-1", "--format=%h", "--abbrev=12", "--", "src", "kernel", "Cargo.toml", "Cargo.lock", "build.rs", "rust-toolchain.toml"],
+                          capture_output=True, text=True, cwd=ROOT).stdout.strip()
     if commits != {head}:
-        sys.exit(f"ship: the boxes report commits {sorted(commits)}, HEAD is {head}")
+        sys.exit(f"ship: the boxes report commits {sorted(commits)}, the source commit is {head}")
     if len(hashes) != 1:
         sys.exit(f"ship: the boxes built different binaries: {sorted(hashes)}")
     print(f"fleet: {len(results)} boxes, commit {head}, binary {hashes.pop()}")
@@ -133,7 +135,8 @@ elif a.command == "run-phases":
     label, code, out = ssh(box, f"cd pnqueens && sh tools/start_worker.sh {a.n} {a.stride} --phases {a.phases} --label {box[2]} {tag} {'--redo' if a.redo else ''}{extra}")
     print(f"{label}: {out}")
 elif a.command == "stop":
-    everywhere(fleet, lambda b: ssh(b, f"kill $(cat runs/worker_{run}.pid) 2>/dev/null && echo stopped || echo 'not running'"))
+    # The worker and the phase it is running: its process group (start_worker.sh).
+    everywhere(fleet, lambda b: ssh(b, f"kill -- -$(cat runs/worker_{run}.pid) 2>/dev/null && echo stopped || echo 'not running'"))
 elif a.command == "status":
     everywhere(fleet, lambda b: ssh(b, f"last=$(tail -n 1 runs/{run}/logs/{b[2]}.log 2>/dev/null); "
                                        f"unpushed=$(( $(ls runs/{run}/rowsets_*.csv runs/{run}/rowsets_*.json 2>/dev/null | wc -l) - $(ls runs/{run}/*.pushed 2>/dev/null | wc -l) )); "

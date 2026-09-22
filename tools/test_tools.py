@@ -111,7 +111,8 @@ def ship_tests():
     subprocess.run(["git", "clone", "-q", os.path.join(HERE, ".."), clone], check=True)
     shutil.copy(os.path.join(HERE, "ship.sh"), os.path.join(clone, "tools", "ship.sh"))
     subprocess.run(["git", "-C", clone, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qa", "--allow-empty", "-m", "test"], check=True)
-    commit = subprocess.run(["git", "-C", clone, "rev-parse", "--short=12", "HEAD"], capture_output=True, text=True).stdout.strip()
+    commit = subprocess.run(["git", "-C", clone, "log", "-1", "--format=%h", "--abbrev=12", "--", "src", "kernel", "Cargo.toml", "Cargo.lock", "build.rs", "rust-toolchain.toml"],
+                            capture_output=True, text=True).stdout.strip()   # the source commit, as ship.sh computes it
     box = os.path.join(tmp, "box")
     fakebin = os.path.join(tmp, "fakebin")
     os.makedirs(os.path.join(box, ".cargo", "bin"))
