@@ -10,17 +10,21 @@
 //! set:
 //!
 //!     # pnqueens n=8 stride=1 phase=0 workmap=76f14ac1f9ff5e3b items=71 ...
-//!     n,rowset_hex,weight,count
-//!     8,0000000f,4,0
+//!     n,rowset_hex,weight,count,even_leaves,odd_leaves
+//!     8,0000000f,4,0,16,4
 //!
 //! `rowset_hex` is the row bitmask (bit r set = a queen on an even square of
 //! row r), `weight` the size of its symmetry orbit, `count` the unweighted
-//! count. Lines are written in the order results arrive and flushed when the
-//! caller asks (after each GPU batch), so an interrupted run keeps the row
-//! sets it finished. `n` is repeated on every line so files from different
-//! machines can be concatenated and checked together. The provenance line
-//! holds `key=value` pairs (see `provenance_line` in main.rs); files from
-//! before it existed have none.
+//! count, `even_leaves` the number of even-square placements on those rows
+//! and `odd_leaves` the number of odd-square placements on the other rows
+//! (the two solution sets whose join the count is; each can be checked
+//! without the tables). Lines are written in the order results arrive and
+//! flushed when the caller asks (after each GPU batch), so an interrupted
+//! run keeps the row sets it finished. `n` is repeated on every line so
+//! files from different machines can be concatenated and checked together.
+//! The provenance line holds `key=value` pairs (see `count` in main.rs).
+//! Files from before 2026-09-22 have neither the provenance line nor the
+//! leaf columns; they are read without leaf counts.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -33,12 +37,24 @@ pub struct RowsetCount {
     pub mask: u32,
     pub weight: u32,
     pub count: u64,
+    /// The numbers of even-square and odd-square placements joined; None in
+    /// records from before the columns existed.
+    pub leaves: Option<[u64; 2]>,
 }
 
 impl RowsetCount {
     /// This row set's contribution to Q(n).
     pub fn weighted(&self) -> u64 {
         u64::from(self.weight).checked_mul(self.count).expect("weighted count overflows u64")
+    }
+
+    /// Whether two records of the same row set say the same: the same
+    /// count, and the same leaf counts when both have them.
+    pub fn agrees_with(&self, other: &RowsetCount) -> bool {
+        self.weight == other.weight && self.count == other.count && match (self.leaves, other.leaves) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        }
     }
 }
 
@@ -59,7 +75,7 @@ impl RowsetLog {
         let file = File::create_new(path)?;
         let mut log = Self::new(n, Box::new(BufWriter::new(file)));
         writeln!(log.out, "# {provenance}")?;
-        writeln!(log.out, "n,rowset_hex,weight,count")?;
+        writeln!(log.out, "n,rowset_hex,weight,count,even_leaves,odd_leaves")?;
         Ok(log)
     }
 
@@ -74,7 +90,8 @@ impl RowsetLog {
     }
 
     pub fn record(&mut self, r: &RowsetCount) -> io::Result<()> {
-        writeln!(self.out, "{},{:08x},{},{}", self.n, r.mask, r.weight, r.count)?;
+        let [even, odd] = r.leaves.expect("a record written by this program has its leaf counts");
+        writeln!(self.out, "{},{:08x},{},{},{},{}", self.n, r.mask, r.weight, r.count, even, odd)?;
         self.total += u128::from(r.weighted());
         self.written += 1;
         Ok(())
@@ -130,14 +147,21 @@ pub fn read_rowset_files(paths: &[String]) -> Result<Records, String> {
             }
             let bad = || format!("{path}:{}: cannot parse '{line}'", i + 1);
             let fields: Vec<&str> = line.split(',').collect();
-            let [n_str, mask_hex, weight_str, count_str] = fields.as_slice() else {
-                return Err(bad());
+            let (n_str, mask_hex, weight_str, count_str, leaves) = match fields.as_slice() {
+                [n, m, w, c, e, o] => (n, m, w, c, Some((e, o))),
+                [n, m, w, c] => (n, m, w, c, None),
+                _ => return Err(bad()),
             };
             let line_n: u32 = n_str.parse().map_err(|_| bad())?;
+            let parse = |s: &str| s.parse::<u64>().map_err(|_| bad());
             let row = RowsetCount {
                 mask: u32::from_str_radix(mask_hex, 16).map_err(|_| bad())?,
                 weight: weight_str.parse().map_err(|_| bad())?,
-                count: count_str.parse().map_err(|_| bad())?,
+                count: parse(count_str)?,
+                leaves: match leaves {
+                    Some((e, o)) => Some([parse(e)?, parse(o)?]),
+                    None => None,
+                },
             };
             match n {
                 None => n = Some(line_n),

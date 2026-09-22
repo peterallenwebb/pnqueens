@@ -14,7 +14,8 @@ table first, with a fingerprint of the list) is cut into S **phases**: phase
 p is the row sets at positions p, p+S, p+2S, … so every phase samples heavy
 and light row sets alike and costs about the same. **Worker** w of W runs the
 phases p ≡ w (mod W); W is the number of boxes. A phase's records are its
-per-row-set counts, `rowsets_N_sS_pP.csv`, headed by a provenance line, and a
+per-row-set counts with their even and odd leaf counts,
+`rowsets_N_sS_pP.csv`, headed by a provenance line, and a
 manifest `rowsets_N_sS_pP.json` with the host, GPU, options, statistics and
 partial sum. The phases of a run are compatible only when cut from the same
 work list; its fingerprint is in the run manifest, in every record and in

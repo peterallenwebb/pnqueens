@@ -116,8 +116,8 @@ pub fn count_queens_gpu(
         let result = gpu.run_batch(&batch)?;
         // Record the batch's row sets; the flush makes them durable before
         // the next batch starts.
-        for (item, &count) in batch.items.iter().zip(&result.counts) {
-            let r = RowsetCount { mask: item.mask, weight: item.weight, count };
+        for ((item, &count), &leaves) in batch.items.iter().zip(&result.counts).zip(&result.leaves) {
+            let r = RowsetCount { mask: item.mask, weight: item.weight, count, leaves: Some(leaves) };
             log.record(&r).map_err(|e| format!("cannot write row-set counts: {e}"))?;
         }
         log.flush().map_err(|e| format!("cannot write row-set counts: {e}"))?;

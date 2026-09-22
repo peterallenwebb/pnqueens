@@ -39,9 +39,10 @@ def validation_exit_tests():
     assert r.returncode == 0 and "Q(8): 92 ok" in r.stdout and "mod-8 check: PASS" in r.stdout, r.stdout
     # One count altered: MISMATCH and mod-8 FAIL, exit 1.
     lines = open(os.path.join(d, "good.csv")).read().splitlines()
-    i = next(i for i, l in enumerate(lines) if l.startswith("8,") and not l.endswith(",0"))
-    n_, mask, w, c = lines[i].split(",")
-    lines[i] = f"{n_},{mask},{w},{int(c) + 1}"
+    i = next(i for i, l in enumerate(lines) if l.startswith("8,") and l.split(",")[3] != "0")
+    f = lines[i].split(",")
+    f[3] = str(int(f[3]) + 1)
+    lines[i] = ",".join(f)
     open(os.path.join(d, "bad.csv"), "w").write("\n".join(lines) + "\n")
     r = subprocess.run([binary, "--sum", os.path.join(d, "bad.csv")], capture_output=True, text=True)
     assert r.returncode == 1 and "MISMATCH" in r.stdout, (r.returncode, r.stdout)

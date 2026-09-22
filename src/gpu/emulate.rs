@@ -74,6 +74,10 @@ fn count_by_emulation(n: u32, prefix_depth: u32, batch_tables: usize) -> u128 {
                 .zip(o)
                 .map(|(&e, &o)| u64::from(e & 0xFFFF) * u64::from(o & 0xFFFF) + u64::from(e >> 16) * u64::from(o >> 16))
                 .sum();
+            let leaves = |t: &[u32]| t.iter().map(|&w| u64::from(w & 0xFFFF) + u64::from(w >> 16)).sum::<u64>();
+            if count != 0 {
+                assert!(leaves(e) != 0 && leaves(o) != 0, "a count needs placements on both colours");
+            }
             total += u128::from(item.weight) * u128::from(count);
         }
     }

@@ -8,11 +8,13 @@
  * word, aligned entry for entry. Its count of full-board solutions is the
  * sum over entries j of E[j] * O[j].
  *
- * Alongside, every block adds the entries it read to `entry_sums` (E and O
- * separately) and the largest entry it saw to `max_entry`. The host
- * compares the sums with the weights the enumerate launches tallied: an
- * entry that overflowed 16 bits would carry into its neighbour and change
- * the sum, so equality proves no entry overflowed.
+ * Alongside, every block adds the entries it read to the item's `leaves`
+ * (E and O separately: the sums of an item's tables are the numbers of
+ * even-square and odd-square placements on its rows, recorded with the
+ * count) and the largest entry it saw to `max_entry`. The host compares
+ * the sums over the batch with the weights the enumerate launches tallied:
+ * an entry that overflowed 16 bits would carry into its neighbour and
+ * change the sum, so equality proves no entry overflowed.
  *
  * Grid: blockIdx.x is the item, blockIdx.y a chunk of JOIN_CHUNK consecutive
  * words of it; blocks past the end of an item's table exit at once. Each
@@ -40,7 +42,7 @@ extern "C" __global__ void join_kernel(
     const u32* __restrict__ e_tables,
     const u32* __restrict__ o_tables,
     u64* __restrict__ sums,                    /* [n_items] results, zero at launch */
-    u64* __restrict__ entry_sums,              /* [2] sum of all E entries, of all O entries; zero at launch */
+    u64* __restrict__ leaves,                  /* [2 * n_items] sum of the item's E entries, of its O entries; zero at launch */
     u32* __restrict__ max_entry)               /* [1] largest entry of either table; zero at launch */
 {
     const u32 item = blockIdx.x;
@@ -70,8 +72,8 @@ extern "C" __global__ void join_kernel(
     largest = warp_max(largest);
     if ((threadIdx.x & 31u) == 0u) {
         if (part != 0ull) atomicAdd(sums + item, part);
-        if (sum_e != 0ull) atomicAdd(entry_sums, sum_e);
-        if (sum_o != 0ull) atomicAdd(entry_sums + 1, sum_o);
+        if (sum_e != 0ull) atomicAdd(leaves + 2u * item, sum_e);
+        if (sum_o != 0ull) atomicAdd(leaves + 2u * item + 1u, sum_o);
         if (largest != 0u) atomicMax(max_entry, largest);
     }
 }

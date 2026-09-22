@@ -40,7 +40,7 @@ cargo build --release --features cuda                  # the GPU path (NVIDIA dr
 ./target/release/pnqueens 24 --cuda                    # Q(24) on an RTX 5090 in about five minutes
 ./target/release/pnqueens 28 --cuda --stride 600 --phase 7   # one phase of a fleet run
 ./target/release/pnqueens --sum rowsets_28_s600_p*.csv       # re-tabulate and check records
-./target/release/pnqueens 28 --rowset 0aaaaaaa         # one row set on the CPU, as a record line
+./target/release/pnqueens 28 --rowset 0aaaaaaa         # one row set on the CPU, as a record line: count and the two leaf counts
 ./target/release/pnqueens 28 --mod8 2564269152506723832
 ```
 

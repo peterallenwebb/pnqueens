@@ -48,9 +48,12 @@ through the tooling. A full count (`pnqueens N`) applies checks 2 and 3 to
 its own total and exits 1 on a failure; `--mod8 TOTAL` exits 1 on FAIL.
 
 1. **Coverage and weights.** Every feasible row set appears exactly once with
-   its symmetry weight, or more than once with identical counts; a
+   its symmetry weight, or more than once with identical records; a
    disagreement is a CONFLICT and no total is printed. The phases of the
    stride are all present. Every file carries the same work-map fingerprint.
+   A record is `n,rowset_hex,weight,count,even_leaves,odd_leaves`: the count
+   and the sizes of the two one-colour solution sets it joins. No row set
+   may have a count without placements on both colours.
 2. **The published value** for n ≤ 27, and for n = 28 the value of the
    reference project (2,564,269,152,506,723,832, computed in 2026 by a
    different program: a read-side join of the same decomposition on a fleet
@@ -96,5 +99,9 @@ cargo build --release
 
 `--rowset` prints the exact line the records must contain for that row
 set: pick lines at random, or the heaviest, or the ones you distrust. The
+two leaf counts on the line can also be checked by a program of a few dozen
+lines that counts non-attacking placements on one colour of the given rows
+(the test `one_row_set_matches_a_direct_count` contains one), which tests
+the search without the tables or the join; the count tests all three. The
 whole count on a CPU is out of reach for n ≥ 26, but every part of it is
 within reach of anyone, which is what the per-row-set records are for.

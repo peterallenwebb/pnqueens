@@ -286,8 +286,9 @@ fn audit_rowset(n: u32, mask: u32) {
         fail(&format!("{mask:08x} is not a representative feasible row set for n = {n} (see feasible_row_sets)"));
     };
     let start = Instant::now();
-    let count = count_solutions(n, &row_set);
-    println!("{n},{mask:08x},{},{count}", row_set.weight);
+    let r = count_solutions(n, &row_set);
+    let [even, odd] = r.leaves.unwrap_or([0, 0]);
+    println!("{n},{mask:08x},{},{},{even},{odd}", r.weight, r.count);
     eprintln!("({:.1}s on the CPU)", start.elapsed().as_secs_f64());
 }
 
@@ -311,10 +312,11 @@ fn mod8_check(n: u32, total: Option<u128>) -> bool {
 
 /// Re-tabulates Q(n) from record files and checks them: one work map across
 /// the files, the phases of a stride present, duplicate row sets in
-/// agreement, every feasible row set exactly once with the right weight, the
-/// total against the published value, and the mod-8 identity. Returns the
-/// exit status: 0 when complete and every check passed, EXIT_PARTIAL when
-/// incomplete; a failed check exits EXIT_FAILED.
+/// agreement, every feasible row set exactly once with the right weight, no
+/// count without placements on both colours, the total against the
+/// published value, and the mod-8 identity. Returns the exit status: 0 when
+/// complete and every check passed, EXIT_PARTIAL when incomplete; a failed
+/// check exits EXIT_FAILED.
 fn retabulate(files: &[String]) -> i32 {
     let records = read_rowset_files(files).unwrap_or_else(|e| fail(&e));
     let n = records.n;
@@ -352,10 +354,19 @@ fn retabulate(files: &[String]) -> i32 {
             Some(weight) => fail(&format!("row set {:08x} has weight {}, expected {weight}", row.mask, row.weight)),
             None => fail(&format!("row set {:08x} is not a representative feasible row set for n = {n}", row.mask)),
         }
+        if let Some([even, odd]) = row.leaves
+            && row.count != 0
+            && (even == 0 || odd == 0)
+        {
+            fail(&format!("row set {:08x} has count {} but {even} even and {odd} odd placements", row.mask, row.count));
+        }
         match seen.insert(row.mask, *row) {
             None => {}
-            Some(earlier) if earlier == *row => verified += 1,
-            Some(earlier) => fail(&format!("CONFLICT: row set {:08x} recorded as {} and as {}", row.mask, earlier.count, row.count)),
+            Some(earlier) if earlier.agrees_with(row) => verified += 1,
+            Some(earlier) => fail(&format!(
+                "CONFLICT: row set {:08x} recorded as {} (placements {:?}) and as {} (placements {:?})",
+                row.mask, earlier.count, earlier.leaves, row.count, row.leaves
+            )),
         }
     }
     let total: u128 = seen.values().map(|r| u128::from(r.weighted())).sum();
@@ -425,10 +436,7 @@ fn reference(n: u32) -> Option<u128> {
 /// The selected row sets counted on the CPU, each an independent search,
 /// in parallel. `collect` keeps the order, so the records are in item order.
 fn count_on_cpu(n: u32, items: &[RowSet], log: &mut RowsetLog) -> Device {
-    let results: Vec<RowsetCount> = items
-        .par_iter()
-        .map(|item| RowsetCount { mask: item.mask, weight: item.weight, count: count_solutions(n, item) })
-        .collect();
+    let results: Vec<RowsetCount> = items.par_iter().map(|item| count_solutions(n, item)).collect();
     for r in &results {
         log.record(r).unwrap_or_else(|e| fail(&format!("cannot write row-set counts: {e}")));
     }
@@ -452,45 +460,54 @@ fn count_on_gpu(_args: &Args, _items: &[RowSet], _log: &mut RowsetLog) -> Device
     fail("this binary was built without the cuda feature (cargo build --release --features cuda)");
 }
 
-/// One row set's count: sum over C of E[R, C] * O[R̅, C̅], on the CPU.
-fn count_solutions(n: u32, row_set: &RowSet) -> u64 {
-    match get_erc(n, row_set.mask) {
-        None => 0,
-        Some(erc) => backtrack_odd_solutions(n, &erc, work::complement(n, row_set.mask)),
-    }
+/// One row set's record on the CPU: its count, sum over C of
+/// E[R, C] * O[R̅, C̅], and the sizes of the two solution sets joined, the
+/// even-square placements on R and the odd-square placements on R̅.
+fn count_solutions(n: u32, row_set: &RowSet) -> RowsetCount {
+    let (erc, even_leaves) = get_erc(n, row_set.mask);
+    let (count, odd_leaves) = backtrack_odd_solutions(n, erc.as_ref(), work::complement(n, row_set.mask));
+    RowsetCount { mask: row_set.mask, weight: row_set.weight, count, leaves: Some([even_leaves, odd_leaves]) }
 }
 
-// Computes the table E[R, C] for all C, indexed by column set. Returns None
-// when there are no even-square placements on R at all (every entry would be
-// zero), so the caller can skip the odd-square search.
-fn get_erc(n: u32, row_bitmask: u32) -> Option<SolutionTable> {
+// Computes the table E[R, C] for all C, indexed by column set, and the
+// number of placements in it. The table is None when there are no
+// even-square placements on R at all (every entry would be zero), so the
+// odd-square search has nothing to look up (it still counts its placements,
+// as the GPU does).
+fn get_erc(n: u32, row_bitmask: u32) -> (Option<SolutionTable>, u64) {
     let mut table = SolutionTable::for_rows(n, row_bitmask, 0);
     let leaves = enumerate(n, row_bitmask, 0, u32::MAX, |cols| {
         let (even, odd) = split_columns(cols);
         table.increment_dense(even, odd);
     });
-    (leaves > 0).then_some(table)
+    ((leaves > 0).then_some(table), leaves)
 }
 
 // Run a conventional backtracking search to find all partial n-queens solutions
 // which are counted by O[R̅, C̅]. When one is found, add the corresponding value
-// of E[R, C] to the count. Return the total count. The parameter rcomp is R̅, the
-// available row mask for odd-square queens.
-fn backtrack_odd_solutions(n: u32, erc: &SolutionTable, rcomp: u32) -> u64 {
+// of E[R, C] to the count. Return the total count and the number of odd-square
+// placements. The parameter rcomp is R̅, the available row mask for odd-square
+// queens.
+fn backtrack_odd_solutions(n: u32, erc: Option<&SolutionTable>, rcomp: u32) -> (u64, u64) {
     // Same enumeration as get_erc, but on odd squares; a leaf with column set
     // C̅ contributes E[R, C] where C is the complement of C̅.
     let count = |first_row_columns: u32| {
         let mut total = 0u64;
-        enumerate(n, rcomp, 1, first_row_columns, |cols| {
-            let (even, odd) = split_columns(cols);
-            total += erc.get_complement_dense(even, odd) as u64;
+        let leaves = enumerate(n, rcomp, 1, first_row_columns, |cols| {
+            if let Some(erc) = erc {
+                let (even, odd) = split_columns(cols);
+                total += erc.get_complement_dense(even, odd) as u64;
+            }
         });
-        total
+        (total, leaves)
     };
     match mirror_columns(n, rcomp) {
         // Odd n (see the module docs): placements with the first queen left
         // of centre stand for themselves and their mirror images.
-        Some((left, centre)) => 2 * count(left) + count(centre),
+        Some((left, centre)) => {
+            let ((lc, ll), (cc, cl)) = (count(left), count(centre));
+            (2 * lc + cc, 2 * ll + cl)
+        }
         None => count(u32::MAX),
     }
 }
@@ -770,6 +787,24 @@ mod tests {
                 *m.entry(mask).or_default() += 1;
                 m
             });
+            // Non-attacking placements of one queen per row of `rows` on squares
+            // of one colour, any columns: the leaf counts, counted with nothing
+            // but a plain search (what an auditor would write).
+            fn one_colour_placements(n: u32, rows: u32, parity: u32) -> u64 {
+                fn go(n: u32, rows: u32, parity: u32, r: u32, cols: u32, d1: u64, d2: u64) -> u64 {
+                    if r == n {
+                        return 1;
+                    }
+                    if rows & (1 << r) == 0 {
+                        return go(n, rows, parity, r + 1, cols, d1, d2);
+                    }
+                    (0..n)
+                        .filter(|&c| (r + c) % 2 == parity && cols & (1 << c) == 0 && d1 & (1u64 << (c + n - 1 - r)) == 0 && d2 & (1u64 << (c + r)) == 0)
+                        .map(|c| go(n, rows, parity, r + 1, cols | 1 << c, d1 | 1u64 << (c + n - 1 - r), d2 | 1u64 << (c + r)))
+                        .sum()
+                }
+                go(n, rows, parity, 0, 0, 0, 0)
+            }
             let mut covered = 0u64;
             for row_set in feasible_row_sets(n) {
                 let orbit: std::collections::BTreeSet<u32> = [
@@ -782,8 +817,10 @@ mod tests {
                 .filter(|&m| n.is_multiple_of(2) || m == row_set.mask || m == work::reflect(n, row_set.mask))
                 .collect();
                 let direct: u64 = orbit.iter().map(|m| by_row_set.get(m).copied().unwrap_or(0)).sum();
-                let counted = count_solutions(n, &row_set);
-                assert_eq!(u64::from(row_set.weight) * counted, direct, "n = {n}, row set {:08x}", row_set.mask);
+                let r = count_solutions(n, &row_set);
+                assert_eq!(u64::from(row_set.weight) * r.count, direct, "n = {n}, row set {:08x}", row_set.mask);
+                let expected = [one_colour_placements(n, row_set.mask, 0), one_colour_placements(n, work::complement(n, row_set.mask), 1)];
+                assert_eq!(r.leaves, Some(expected), "leaves of {:08x}", row_set.mask);
                 covered += direct;
             }
             assert_eq!(covered, solutions.len() as u64);
