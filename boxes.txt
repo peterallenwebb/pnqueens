@@ -1,5 +1,3 @@
-17227 root@ssh7.vast.ai box01
-17551 root@ssh1.vast.ai 51977550
 17591 root@ssh3.vast.ai 51977590
 17595 root@ssh3.vast.ai 51977595
 17609 root@ssh9.vast.ai 51977609

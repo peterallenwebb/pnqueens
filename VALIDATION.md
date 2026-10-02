@@ -100,6 +100,18 @@ rehearsals Q(24) … Q(27) reproduced the published values on the same fleet
 with the same binary. The release is `rowsets_28.csv` (10,034,104 lines,
 sorted by row set), the 612 phase manifests, and their SHA-256 sums.
 
+**Q(29) = 28,898,919,943,828,158,328** (2026-09-30, eleven RTX 5090 boxes
+of which four were lost on the way and their phases redistributed, stride
+3000, binary source commit eedf00645cfd, 1,636.6 GPU-hours plus 12.4 for the
+sample) passed the chain that applies without a reference value: 3000 of
+3000 phases, every one of the 38,781,096 row sets recorded once with its
+weight, thirty phases (387,811 row sets) recomputed at prefix depth 7 and 4
+blocks per SM in exact agreement with the main run's depth 6 and 8 blocks,
+and mod-8 PASS with S₂ = 3,600,075,088. Q(28) had been confirmed against the
+reference project on the same fleet with the same binary eight days earlier.
+The release is `rowsets_29.csv` (38,781,096 row sets, sorted by row set),
+the 3,030 phase manifests, and their SHA-256 sums.
+
 ## 4. Auditing a release
 
 A release is the merged CSV of every row set of a count, its manifests, and

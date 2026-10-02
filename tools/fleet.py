@@ -38,15 +38,36 @@ def ssh(box, command, timeout=None):
     return label, r.returncode, (r.stdout + (r.stderr if r.returncode else "")).strip()
 
 
-def scp(box, src, dst):
+def ship_file(box, src, dst, piece=131072):
+    """Copies a file to a box in pieces piped over ssh into `cat`, each piece
+    verified by size and retried, then assembled: some gateways do not proxy
+    scp, and some reset long transfers."""
     port, host, label = box
-    return subprocess.run(["scp", "-P", port, *SSH_OPTS, src, f"{host}:{dst}"], capture_output=True, text=True).returncode == 0
+    def remote(cmd, data=None):
+        r = subprocess.run(["ssh", "-p", port, *SSH_OPTS, host, cmd], input=data, capture_output=True)
+        return r.returncode == 0, r.stdout.decode(errors="replace").strip()
+    data = open(src, "rb").read()
+    pieces = [data[i:i + piece] for i in range(0, len(data), piece)] or [b""]
+    ok, _ = remote(f"mkdir -p $(dirname {dst}) && rm -f {dst}.piece.*")
+    if not ok:
+        return False
+    for i, chunk in enumerate(pieces):
+        for attempt in range(5):
+            ok, out = remote(f"cat > {dst}.piece.{i:05d} && wc -c < {dst}.piece.{i:05d}", chunk)
+            if ok and out == str(len(chunk)):
+                break
+        else:
+            return False
+    ok, out = remote(f"cat {dst}.piece.* > {dst}.part && rm -f {dst}.piece.* && wc -c < {dst}.part && mv {dst}.part {dst}")
+    return ok and out == str(len(data))
 
 
-def everywhere(fleet, fn, require=None):
+def everywhere(fleet, fn, require=None, fatal=True):
     """Runs fn on every box in parallel and prints the results. Exits non-zero
-    if any box failed or, given `require`, if its output fails that check;
-    returns the outputs by label otherwise."""
+    if any box failed or, given `require`, if its output fails that check
+    (unless `fatal` is off: then the failures are printed and the rest goes
+    on, as a status report must when a box is unreachable); returns the
+    outputs by label."""
     results = {}
     failed = []
     with ThreadPoolExecutor(len(fleet)) as pool:
@@ -55,13 +76,13 @@ def everywhere(fleet, fn, require=None):
                 print(f"{label}: {line}")
             results[label] = out
             if code:
-                print(f"{label}: EXIT {code}")
+                print(f"{label}: {'UNREACHABLE' if code == 255 else f'EXIT {code}'}")
                 failed.append(label)
             elif require and not require(out):
                 print(f"{label}: FAILED the check")
                 failed.append(label)
     sys.stdout.flush()
-    if failed:
+    if failed and fatal:
         sys.exit(f"{a.command}: failed on {', '.join(failed)}")
     return results
 
@@ -117,8 +138,8 @@ elif a.command == "push-urls":
     if a.renew or not os.path.exists(env_file):
         subprocess.run([sys.executable, os.path.join(HERE, "presign.py"), str(a.n), "--stride", str(a.stride), "--hosts", a.hosts, "--tag", a.tag], check=True)
     def ship_urls(box):
-        ok = scp(box, env_file, f"runs/push_urls{tag}.env")
-        return box[2], 0 if ok else 1, "URLs shipped" if ok else "scp failed"
+        ok = ship_file(box, env_file, f"runs/push_urls{tag}.env")
+        return box[2], 0 if ok else 1, "URLs shipped" if ok else "shipping the URL file failed"
     everywhere(fleet, ship_urls)
 elif a.command == "start":
     W = len(fleet)
@@ -138,7 +159,7 @@ elif a.command == "stop":
     # The worker and the phase it is running: its process group (start_worker.sh).
     everywhere(fleet, lambda b: ssh(b, f"kill -- -$(cat runs/worker_{run}.pid) 2>/dev/null && echo stopped || echo 'not running'"))
 elif a.command == "status":
-    everywhere(fleet, lambda b: ssh(b, f"last=$(tail -n 1 runs/{run}/logs/{b[2]}.log 2>/dev/null); "
+    everywhere(fatal=False, fleet=fleet, fn=lambda b: ssh(b, f"last=$(tail -n 1 runs/{run}/logs/{b[2]}.log 2>/dev/null); "
                                        f"unpushed=$(( $(ls runs/{run}/rowsets_*.csv runs/{run}/rowsets_*.json 2>/dev/null | wc -l) - $(ls runs/{run}/*.pushed 2>/dev/null | wc -l) )); "
                                        f"if kill -0 $(cat runs/worker_{run}.pid 2>/dev/null) 2>/dev/null; then echo -n 'ALIVE  '; "
                                        f"elif echo \"$last\" | grep -q finished; then echo -n 'DONE   '; else echo -n 'DEAD   '; fi; "
