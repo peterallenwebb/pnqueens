@@ -1,18 +1,10 @@
 # pnqueens
 
-Counts n-queens solutions by splitting every solution into its queens on
-even squares and its queens on odd squares, which cannot attack each other
-diagonally, so that Q(n) is a sum over row sets R of
+Counts n-queens solutions by splitting every solution into its queens on even squares and its queens on odd squares, which cannot attack each other diagonally, so that Q(n) is a sum over row sets R of
 
     Σ_C E[R, C] · O[R̄, C̄]
 
-with E and O the numbers of one-color partial solutions on given rows and
-columns (the derivation is the comment at the top of `src/main.rs`). Each row
-set is one bounded search whose leaves are tallied into a dense table, and
-the two tables of a row set are joined by a dot product. There is a CPU path
-and a CUDA path; every count is recorded row set by row set so that it can be
-audited (VALIDATION.md), and a run can be spread over a fleet of GPU boxes
-(RUNBOOK.md).
+with E and O the numbers of one-color partial solutions on given rows and columns (the derivation is the comment at the top of `src/main.rs`). Each row set is one bounded search whose leaves are tallied into a dense table, and the two tables of a row set are joined by a dot product. There is a CPU path and a CUDA path; every count is recorded row set by row set so that it can be audited (VALIDATION.md), and a run can be spread over a fleet of GPU boxes (RUNBOOK.md).
 
 ## Layout
 
@@ -44,5 +36,4 @@ cargo build --release --features cuda                  # the GPU path (NVIDIA dr
 ./target/release/pnqueens 28 --mod8 2564269152506723832
 ```
 
-The toolchain is pinned (`rust-toolchain.toml`) so every box builds the same
-binary; the source commit is recorded in it at build time.
+The toolchain is pinned (`rust-toolchain.toml`) so every box builds the same binary; the source commit is recorded in it at build time.
