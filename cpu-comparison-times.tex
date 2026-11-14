@@ -1,0 +1,83 @@
+% Time for one count of Q(n) on one CPU thread: conventional bitmask
+% backtracking against the checkerboard decomposition. The numbers are the
+% Results table of cpu-comparison.md (Apple M1 Pro, measured 2026-10-29/30):
+% n <= 13 the median of three rounds of 1000 counts, n = 14, 15 the best of
+% three runs, one run above.
+%
+% Compiles on its own. In a paper, either \includegraphics the compiled PDF,
+% or load pgfplots and the standalone package in the preamble and \input
+% this file inside a figure environment (the size is set below).
+\documentclass[tikz]{standalone}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+
+\begin{document}
+% The size. A document that \input{}s this file can set these two before
+% the \input, for instance \newcommand{\plotwidth}{\linewidth}.
+\providecommand{\plotwidth}{12cm}
+\providecommand{\plotheight}{8cm}
+\pgfplotsset{width=\plotwidth, height=\plotheight}
+
+\definecolor{conventional}{HTML}{2A78D6}
+\definecolor{decomposition}{HTML}{EB6834}
+
+\begin{tikzpicture}
+\begin{semilogyaxis}[
+  xlabel={$n$},
+  ylabel={seconds per count, one CPU thread},
+  xmin=5.5, xmax=21.5,
+  ymin=5e-8, ymax=5e4,
+  xtick={6,...,21},
+  ytick={1e-7,1e-6,1e-5,1e-4,1e-3,1e-2,1e-1,1e0,1e1,1e2,1e3,1e4},
+  grid=major,
+  grid style={line width=0.3pt, draw=black!12},
+  axis line style={black!40},
+  tick style={black!40},
+  tick label style={font=\small},
+  label style={font=\small},
+  legend style={font=\small, draw=none, fill=none, at={(0.97,0.03)},
+                anchor=south east},
+  legend cell align=left,
+  clip=false,
+  every axis plot/.append style={line width=1pt, mark size=2pt,
+    mark options={draw=white, line width=0.4pt}},
+]
+
+% Reference durations.
+\addplot[forget plot, black!35, line width=0.4pt, mark=none]
+  coordinates {(5.5,60) (21.5,60)}
+  node[pos=0, anchor=south west, inner sep=1pt, font=\scriptsize,
+       text=black!60] {1 minute};
+\addplot[forget plot, black!35, line width=0.4pt, mark=none]
+  coordinates {(5.5,3600) (21.5,3600)}
+  node[pos=0, anchor=south west, inner sep=1pt, font=\scriptsize,
+       text=black!60] {1 hour};
+
+% Conventional backtracking, n = 6 ... 20.
+\addplot[conventional, mark=square*, mark options={fill=conventional}]
+coordinates {
+  (6, 1.6e-7) (7, 5.5e-7) (8, 2.10e-6) (9, 8.53e-6) (10, 7.584e-5)
+  (11, 4.552e-4) (12, 2.525e-3) (13, 1.3361e-2) (14, 0.078) (15, 0.487)
+  (16, 3.252) (17, 22.847) (18, 169.099) (19, 1314.715) (20, 10763.141)
+};
+\addlegendentry{conventional backtracking}
+
+% Checkerboard decomposition, n = 6 ... 21.
+\addplot[decomposition, mark=*, mark options={fill=decomposition}]
+coordinates {
+  (6, 4.57e-6) (7, 8.44e-6) (8, 1.176e-5) (9, 2.909e-5) (10, 6.623e-5)
+  (11, 4.1851e-4) (12, 1.284e-3) (13, 6.971e-3) (14, 0.021) (15, 0.132)
+  (16, 0.427) (17, 2.890) (18, 9.927) (19, 72.409) (20, 264.98)
+  (21, 2029.726)
+};
+\addlegendentry{checkerboard decomposition}
+
+% Direct labels, in text colour; the marks carry the series colour.
+\node[anchor=south east, xshift=-3pt, yshift=3pt, font=\small, text=black!75]
+  at (axis cs:18, 169.099) {conventional};
+\node[anchor=north west, xshift=3pt, yshift=-3pt, font=\small, text=black!75]
+  at (axis cs:18, 9.927) {decomposition};
+
+\end{semilogyaxis}
+\end{tikzpicture}
+\end{document}

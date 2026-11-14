@@ -54,3 +54,7 @@ cargo build --release --features cuda                  # the GPU path (NVIDIA dr
 ```
 
 The toolchain is pinned (`rust-toolchain.toml`) so every box builds the same binary; the source commit is recorded in it at build time.
+
+## License
+
+MIT; see `LICENSE`.
