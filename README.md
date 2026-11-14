@@ -1,3 +1,5 @@
+This repository was used to independently re-implement from scratch the algorithm established in [peterallenwebb/n-queens](https://github.com/peterallenwebb/n-queens), and to re-confirm the value of Q(28) computed with it. The value of Q(29) was also calculated, as described below.
+
 # pnqueens
 
 Counts n-queens solutions by splitting every solution into its queens on even squares and its queens on odd squares, which cannot attack each other diagonally, so that Q(n) is a sum over row sets R of
