@@ -62,6 +62,7 @@
 //! each placement twice, plus the centre column, counted once. See
 //! `backtrack_odd_solutions` and `mirror_columns`.
 
+mod conventional;
 #[cfg(any(feature = "cuda", test))]
 mod gpu;
 mod rowset_log;
@@ -85,8 +86,12 @@ const EXIT_PARTIAL: i32 = 3;
 
 fn main() {
     let args = parse_args();
+    if let Some(threads) = args.threads {
+        rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().unwrap_or_else(|e| fail(&format!("cannot set up {threads} threads: {e}")));
+    }
     let code = match &args.mode {
         Mode::Count => count(&args),
+        Mode::Conventional => conventional_count(args.n, args.repeat),
         Mode::Version => {
             let id = Identity::of_this_run();
             println!("pnqueens commit {} binary {}", id.commit, id.binary_sha256);
@@ -132,7 +137,17 @@ fn count(args: &Args) -> i32 {
     );
     let mut log = RowsetLog::create(&out, n, &provenance).unwrap_or_else(|e| fail(&format!("cannot create {}: {e}", out.display())));
     println!("PREPARED {} of {} row sets (stride {}, phase {}, work map {workmap:016x})", selected.len(), items.len(), args.selection.stride, args.selection.phase);
+    let counting = Instant::now();
     let device = if args.cuda { count_on_gpu(args, &selected, &mut log) } else { count_on_cpu(n, &selected, &mut log) };
+    for _ in 1..args.repeat {
+        // Timing repetitions (--repeat, CPU only): counted again without records, and required to agree.
+        let mut again = RowsetLog::discard(n);
+        count_on_cpu(n, &selected, &mut again);
+        if again.total() != log.total() {
+            fail("repeated counts disagree");
+        }
+    }
+    println!("{}", counted_in(counting.elapsed().as_secs_f64(), args.repeat));
     log.flush().unwrap_or_else(|e| fail(&format!("cannot write {}: {e}", out.display())));
     println!("{} row-set counts written to {}", log.written(), out.display());
     let passed = if args.selection.is_all() {
@@ -290,6 +305,40 @@ fn audit_rowset(n: u32, mask: u32) {
     let [even, odd] = r.leaves.unwrap_or([0, 0]);
     println!("{n},{mask:08x},{},{},{even},{odd}", r.weight, r.count);
     eprintln!("({:.1}s on the CPU)", start.elapsed().as_secs_f64());
+}
+
+/// Q(n) by conventional backtracking on one thread (conventional.rs), checked
+/// against the known value: the baseline the decomposition is compared with.
+fn conventional_count(n: u32, repeat: u32) -> i32 {
+    let start = Instant::now();
+    let q = conventional::count(n);
+    for _ in 1..repeat {
+        // black_box keeps the compiler from computing the loop-invariant count once.
+        if conventional::count(std::hint::black_box(n)) != q {
+            fail("repeated counts disagree");
+        }
+    }
+    println!("{} (conventional backtracking, one thread)", counted_in(start.elapsed().as_secs_f64(), repeat));
+    if report(n, q) { 0 } else { EXIT_FAILED }
+}
+
+/// "counted in 2.890 s"; for repeated counts (--repeat) the total and the
+/// mean per count.
+fn counted_in(secs: f64, repeat: u32) -> String {
+    /// A duration in the unit that resolves it.
+    fn human(secs: f64) -> String {
+        if secs >= 1.0 {
+            format!("{secs:.3} s")
+        } else if secs >= 1e-3 {
+            format!("{:.3} ms", secs * 1e3)
+        } else {
+            format!("{:.2} µs", secs * 1e6)
+        }
+    }
+    if repeat == 1 {
+        return format!("counted in {}", human(secs));
+    }
+    format!("counted {repeat} times in {}: {} per count", human(secs), human(secs / f64::from(repeat)))
 }
 
 /// The number of solutions fixed by the 180° rotation, and, given a total,
@@ -611,6 +660,8 @@ enum Mode {
     Items,
     /// `--rowset HEX`: one row set on the CPU.
     RowSet(u32),
+    /// `--conventional`: Q(n) by plain backtracking on one thread, the baseline.
+    Conventional,
     /// `--mod8 [TOTAL]`: the rotation-fixed count, and the check of a total.
     Mod8(Option<u128>),
     /// `--sum FILE...`: re-tabulate and check record files.
@@ -624,6 +675,10 @@ struct Args {
     mode: Mode,
     /// Run on a CUDA GPU instead of the CPU.
     cuda: bool,
+    /// Threads for the CPU path (--threads); None means one per core.
+    threads: Option<usize>,
+    /// Times to count, for timing small n (--repeat, CPU path); the mean per count is reported.
+    repeat: u32,
     /// CUDA device index (--device).
     device: usize,
     /// Ticket prefix depth (--prefix); None means the GPU path's default for n.
@@ -645,15 +700,18 @@ fn parse_args() -> Args {
     let argv: Vec<String> = std::env::args().collect();
     let usage = || -> ! {
         eprintln!(
-            "usage: {0} <n> [--cuda] [--device I] [--prefix P] [--table-mem MiB] [--blocks-per-sm B]\n\
+            "usage: {0} <n> [--cuda] [--device I] [--prefix P] [--table-mem MiB] [--blocks-per-sm B] [--threads T] [--repeat K]\n\
              \x20                 [--stride S --phase P] [--out FILE] [--manifest FILE]\n\
              \x20      {0} <n> --items\n\
              \x20      {0} <n> --rowset HEX\n\
+             \x20      {0} <n> --conventional [--repeat K]\n\
              \x20      {0} <n> --mod8 [TOTAL]\n\
              \x20      {0} --sum FILE...\n\
              \x20      {0} --version\n\
              \x20 1 <= n <= 31\n\
              \x20 --cuda        Run on a CUDA GPU (build with --features cuda)\n\
+             \x20 --threads T   (CPU mode) Threads for the search and the mod-8 check (default: one per core)\n\
+             \x20 --repeat K    (CPU mode) Count K times and report the mean time per count, for timing small n (default 1)\n\
              \x20 --device I    (CUDA mode only) CUDA device index (default 0)\n\
              \x20 --prefix P    (CUDA mode only) Rows fixed per GPU ticket (default: the least that keeps the tables in flight within L2)\n\
              \x20 --table-mem M (CUDA mode only) Device memory for tables per batch, MiB (default 8192)\n\
@@ -664,6 +722,7 @@ fn parse_args() -> Args {
              \x20 --items       Print the number of work items and the work map fingerprint\n\
              \x20 --version     Print the source commit the binary was built from and its SHA-256\n\
              \x20 --rowset HEX  Count one row set on the CPU and print its record line (an audit of one line of the records)\n\
+             \x20 --conventional  Count Q(n) by conventional bitmask backtracking on one thread (the baseline of cpu-comparison.md)\n\
              \x20 --mod8 [TOTAL]  Count the 180°-symmetric solutions S2; with TOTAL, check TOTAL ≡ S2 (mod 8)\n\
              \x20 --sum FILE... Re-tabulate Q(n) from record files and check them (coverage, weights, phases, duplicates, mod 8)",
             argv.first().map_or("pnqueens", String::as_str)
@@ -674,6 +733,8 @@ fn parse_args() -> Args {
         n: 0,
         mode: Mode::Count,
         cuda: false,
+        threads: None,
+        repeat: 1,
         device: 0,
         prefix_depth: None,
         table_mem_mib: 8192,
@@ -689,6 +750,8 @@ fn parse_args() -> Args {
         let mut value = |what: &str| -> String { rest.next().cloned().unwrap_or_else(|| { eprintln!("{what} needs a value"); usage() }) };
         match arg.as_str() {
             "--cuda" => args.cuda = true,
+            "--threads" => args.threads = Some(value("--threads").parse().ok().filter(|&t| t > 0).unwrap_or_else(|| usage())),
+            "--repeat" => args.repeat = value("--repeat").parse().ok().filter(|&k| k > 0).unwrap_or_else(|| usage()),
             "--device" => args.device = value("--device").parse().unwrap_or_else(|_| usage()),
             "--prefix" => args.prefix_depth = Some(value("--prefix").parse().unwrap_or_else(|_| usage())),
             "--table-mem" => args.table_mem_mib = value("--table-mem").parse().unwrap_or_else(|_| usage()),
@@ -707,6 +770,10 @@ fn parse_args() -> Args {
             }
             "--rowset" => {
                 args.mode = Mode::RowSet(u32::from_str_radix(&value("--rowset"), 16).unwrap_or_else(|_| usage()));
+                modes += 1;
+            }
+            "--conventional" => {
+                args.mode = Mode::Conventional;
                 modes += 1;
             }
             "--mod8" => {
@@ -733,7 +800,7 @@ fn parse_args() -> Args {
             },
         }
     }
-    if modes > 1 || args.selection.stride == 0 || args.selection.phase >= args.selection.stride {
+    if modes > 1 || args.selection.stride == 0 || args.selection.phase >= args.selection.stride || (args.repeat > 1 && args.cuda) {
         usage();
     }
     if matches!(args.mode, Mode::Sum(_) | Mode::Version) {

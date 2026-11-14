@@ -79,8 +79,7 @@ impl RowsetLog {
         Ok(log)
     }
 
-    /// A log that only keeps the total (for tests).
-    #[cfg(test)]
+    /// A log that only keeps the total (for tests, and the timing repetitions of --repeat).
     pub fn discard(n: u32) -> Self {
         Self::new(n, Box::new(io::sink()))
     }

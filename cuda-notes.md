@@ -215,6 +215,7 @@ n = 27 ≈ 37 h, Q(28) ≈ 150–170 5090-hours and Q(29) ≈ 1550–1900 h.
 Unmeasured risk: the heaviest table is 47 MB at n = 28 and 88 MB at n = 29
 against a 96 MB L2; if the atomics spill to DRAM the n = 23 depth-3
 experience says up to ~2× slower. An n = 26 run would pin the exponent.
+(Measured since: 2.12.)
 
 ### 2.8 Hardware counters at last (2026-09-20)
 
@@ -385,6 +386,60 @@ an hour), so the checklist uses n = 10. The kernel's tally check cannot see
 this class of error, since a search on a corrupted prefix tallies
 consistently with itself, and the one-lane emulator has no races at all.
 
+### 2.12 Production: Q(26) to Q(29) on the fleet (2026-09-21 to 09-30)
+
+The kernel of 2.10 and 2.11 ran the rehearsals and the two production
+counts on eleven rented RTX 5090 boxes (RUNBOOK.md, VALIDATION.md). From
+the phase manifests, summed over all phases and both colours:
+
+| n | row sets | 5090-hours | search steps | steps/s | leaves | tickets dead | prefix, blocks/SM | largest entry |
+|---|---|---|---|---|---|---|---|---|
+| 26 | 2,602,198 | 3.1 | 2.58 × 10¹⁵ | 2.36 × 10¹¹ | 5.89 × 10¹⁴ | 84.5% | 5, 8 | 2,755 |
+| 27 | 10,030,008 | 27.5 | 2.32 × 10¹⁶ | 2.35 × 10¹¹ | 5.65 × 10¹⁵ | 93.3% | 6, 8 | 6,824 |
+| 28 | 10,034,104 | 124.7 | 1.02 × 10¹⁷ | 2.28 × 10¹¹ | 2.45 × 10¹⁶ | 92.6% | 6, 8 | 10,156 |
+| 29 | 38,781,096 | 1,636.6 | 9.53 × 10¹⁷ | 1.62 × 10¹¹ | 2.44 × 10¹⁷ | 92.0% | 6, 9 | 30,140 |
+
+The join is negligible throughout (0.43 of the 1,636.6 hours at n = 29):
+all of the time is the two searches.
+
+**The exponent held, and n = 29 paid the L2 penalty predicted in 2.7.** From
+n = 26 to n = 28 the time grew as Q^0.78, the exponent fitted on n = 20 to
+24. At n = 29 the step rate fell from 2.3 to 1.6 × 10¹¹ per second: the
+heaviest packed tables are 22,084,920 entries, 44 MB, against 23.6 MB at
+n = 28, and with the default rule's window several are in flight in a 96 MB
+L2. The verification sample shows how much of that was avoidable. The same
+phases, on the same fleet:
+
+| n | main run | sample at `--prefix 7 --blocks-per-sm 4` | ratio |
+|---|---|---|---|
+| 28 | 12.5 min a phase (prefix 6, 8 blocks) | 12.4 min | 1.01 |
+| 29 | 32.5 min a phase (prefix 6, 9 blocks) | 24.9 min, 2.13 × 10¹¹ steps/s | 1.31 |
+
+The deeper prefix makes 97% of the tickets dead instead of 92% and costs
+nothing at n = 28, while at n = 29 the lower residency and the smaller
+subtrees presumably keep fewer tables in flight, and most of the step rate
+comes back. Had the whole count run that way it would have taken about
+1,250 hours, close to the 1,170 that Q^0.78 gives from n = 27. (Twelve and
+thirty phases; the boxes differ by about 7% among themselves, far less than
+the effect.) So the rule of 2.5 and 2.10, calibrated at n ≤ 25, is wrong
+once a single table is a large fraction of L2: for n ≥ 29 it should choose
+prefix depth 7 and at most 4 blocks per SM, and it needs recalibrating on a
+box before any larger count.
+
+**Entry width.** The largest 16-bit table entry tripled from n = 28 to
+n = 29 and stands at 46% of the range. The tally check of 2.10 would catch
+an overflow, not prevent it, so n = 30 or 31 may need 32-bit entries for the
+heaviest row sets, at twice the table size.
+
+**Estimate for Q(30).** With Q(30)/Q(29) ≈ 11.6, about 6,000 5090-hours if
+the L2 behaviour could be held at the n = 28 level (Q^0.78 over the two
+steps from n = 28 gives 5,600; the 27 → 28 step, 4.5× for a factor 10.9 in
+Q, applied to the 1,250-hour figure gives 5,900), and perhaps 8,000 to
+12,000 otherwise: the heaviest tables are 41.4 million entries, 83 MB
+packed, as large as the L2 itself, so one item in flight already misses.
+The next gains are therefore in table generation and layout (section 5,
+items 5 and 9), not in the search loop.
+
 ## 3. Things that did not work (keep for reviewers)
 
 - 4-deep software-pipelined read queue: slightly worse than no queue
@@ -442,6 +497,10 @@ In rough order of expected value per unit of effort.
    chunking, and cuts atomics several-fold. Only matters at deep prefixes.
 5. **Large-n table sizes.** At n = 28 the heaviest tables are 47 MB and at
    n = 29 88 MB, comparable to L2; even one item in flight will partly miss.
+   (Packed to 16 bits since: 23.6 MB and 44 MB. Measured in production,
+   2.12: no penalty at n = 28, a 1.3× penalty at n = 29 under the default
+   prefix and residency, most of it recovered by `--prefix 7
+   --blocks-per-sm 4`. The first step is to fix the rule.)
    Ideas: order tickets within an item so that concurrently running tickets
    touch nearby table regions (the colex rank is monotone in the high
    columns, so ordering prefix digits by column may help), or split an
@@ -456,7 +515,12 @@ In rough order of expected value per unit of effort.
    capture of a mode 0 launch at n = 22 would confirm the issue-bound vs.
    latency-bound picture behind item 1 and size the L2 hit rate behind
    item 5.
-8. **Multi-GPU and restart.** Q(28) is hundreds of GPU-hours: the row-set
-   log already makes the computation restartable per item; add a `--skip`
-   of already-logged row sets and a device/shard split so several GPUs can
-   share one run and a crash costs one batch.
+8. **Multi-GPU and restart.** Done differently, by phases of a stride and
+   per-phase records on a fleet (`--stride`, `--phase`, `tools/`,
+   RUNBOOK.md): Q(28) and Q(29) were computed that way (2.12).
+9. **Less table generation.** Nearly all of the time is the two searches
+   that build the tables. Symmetries not yet used would cut it: for odd n
+   the column reflection on the even-square side as well as the odd one
+   (the kernel mirrors only the odd-square search, `uses_mirror`), and the
+   sharing of tables between row sets that are shifts of one another by an
+   even number of rows.

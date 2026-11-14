@@ -7,6 +7,7 @@ This document describes validation procedures. With nothing but the materials in
 | test | establishes |
 |---|---|
 | `known_queen_counts` | the decomposition on the CPU equals OEIS A000170 for n ≤ 15 |
+| `conventional_count_matches_the_published_values` | the conventional backtracking baseline (`--conventional`) equals OEIS A000170 for n ≤ 14 |
 | `one_row_set_matches_a_direct_count` | every row set's count, times its weight, equals the number of brute-force solutions whose even-square queens lie in that row set's orbit (n = 8, 9), and the orbits cover every solution |
 | `weights_account_for_every_feasible_row_set` | the symmetry weights add up to the number of feasible row sets without the symmetry, n ≤ 14 |
 | `phases_add_up_to_the_count`, `phases_partition_the_items` | the phases of a stride partition the work and their partials sum to Q(n) |
@@ -33,15 +34,15 @@ Four checks are applied to finished counts, all made by the binary itself from t
 
 **Provenance.** Every record file contains the binary's source commit, the SHA-256 of the binary, the host, the device, the options, and the work-map fingerprint; every phase's manifest adds the launch statistics, the largest table entry and the wall time. The source commit is the last commit that touched what the binary is built from (`src`, `kernel`, the Cargo files, `build.rs`, the toolchain pin), so commits to tools or documents leave the binary, its hash and its recorded commit unchanged, and the binary rehearsed is provably the binary of the production run; the ship step refuses a dirty tree, so the tools and documents on a box are a commit too.
 
-**The kernel's own check.** Table entries are 16 bits, two to a word. The join sums the entries of each colour and the host requires the sum to equal the weights the searches tallied; an entry that overflowed would have carried into its neighbour and changed the sum, so every batch of every run is proven free of overflow (the largest entries seen are 291 at n = 22, 982 at n = 24, at most 2,224 at n = 25, measured as a bound). Per-row-set counts are u64, totals u128.
+**The kernel's own check.** Table entries are 16 bits, two to a word. The join sums the entries of each colour and the host requires the sum to equal the weights the searches tallied; an entry that overflowed would have carried into its neighbour and changed the sum, so every batch of every run is proven free of overflow (the largest entries seen are 291 at n = 22, 982 at n = 24, at most 2,224 at n = 25, measured as a bound; the production manifests record 2,755 at n = 26, 6,824 at n = 27, 10,156 at n = 28 and 30,140 at n = 29, of a possible 65,535). Per-row-set counts are u64, totals u128.
 
 **Q(28) = 2,564,269,152,506,723,832**
 
-(2026-09-22, eleven RTX 5090-equipped workstations, stride 600, binary source commit eedf00645cfd, 124.7 GPU-hours) passed the whole chain: 600 of 600 phases, every one of the 10,034,104 row sets recorded once with its weight, twelve phases (200,682 row sets) recomputed at prefix depth 7 and 4 blocks per SM in exact agreement with the main run’s depth 6 and 8 blocks, mod-8 PASS with S₂ = 1,250,901,440, and equality with the reference project's value, computed by a different program. The rehearsals Q(24) … Q(27) reproduced the published values on the same fleet with the same binary. The release is `rowsets_28.csv` (10,034,104 lines, sorted by row set), the 612 phase manifests, and their SHA-256 sums.
+(2026-09-22, eleven RTX 5090-equipped workstations, stride 600, binary source commit eedf00645cfd, 124.7 GPU-hours) passed the whole chain: 600 of 600 phases, every one of the 10,034,104 row sets recorded once with its weight, twelve phases (200,682 row sets) recomputed at prefix depth 7 and 4 blocks per SM in exact agreement with the main run’s depth 6 and 8 blocks, mod-8 PASS with S₂ = 1,250,901,440, and equality with the reference project's value, computed by a different program. The rehearsals Q(24) … Q(27) reproduced the published values on the same fleet: Q(24) and Q(25) with the same binary, Q(26) and Q(27) with the binary of the preceding commit (d19354d596eb), which differs from it only in `build.rs`, in how the recorded commit is derived, with `src` and `kernel` identical. The release is `rowsets_28.csv` (10,034,104 lines, sorted by row set), the 612 phase manifests, and their SHA-256 sums.
 
 **Q(29) = 28,898,919,943,828,158,328** 
 
-(2026-09-30, eleven RTX 5090 boxes of which four were lost on the way and their phases redistributed, stride 3000, binary source commit eedf00645cfd, 1,636.6 GPU-hours plus 12.4 for the sample) passed the chain that applies without a reference value: 3000 of 3000 phases, every one of the 38,781,096 row sets recorded once with its weight, thirty phases (387,811 row sets) recomputed at prefix depth 7 and 4 blocks per SM in exact agreement with the main run's depth 6 and 8 blocks, and mod-8 PASS with S₂ = 3,600,075,088. Q(28) had been confirmed against the reference project on the same fleet with the same binary eight days earlier. The release is `rowsets_29.csv` (38,781,096 row sets, sorted by row set), the 3,030 phase manifests, and their SHA-256 sums.
+(2026-09-30, eleven RTX 5090 boxes of which four were lost on the way and their phases redistributed, stride 3000, binary source commit eedf00645cfd, 1,636.6 GPU-hours plus 12.4 for the sample) passed the chain that applies without a reference value: 3000 of 3000 phases, every one of the 38,781,096 row sets recorded once with its weight, thirty phases (387,811 row sets) recomputed at prefix depth 7 and 4 blocks per SM in exact agreement with the main run's depth 6 and 9 blocks, and mod-8 PASS with S₂ = 3,600,075,088. Q(28) had been confirmed against the reference project on the same fleet with the same binary eight days earlier. The release is `rowsets_29.csv` (38,781,096 row sets, sorted by row set), the 3,030 phase manifests, and their SHA-256 sums.
 
 ## 4. Auditing a release
 
@@ -52,6 +53,18 @@ cargo build --release
 ./target/release/pnqueens --sum rowsets_28.csv          # coverage, weights, total, mod 8: minutes
 ./target/release/pnqueens 28 --rowset 0aaaaaaa            # any one line, recomputed on the CPU: minutes
 ./target/release/pnqueens 28 --items                      # the work map the records name
+./target/release/pnqueens --sum rowsets_29.csv          # the same for Q(29): about a quarter of an hour, most of it the count of S₂
 ```
+
+The released files and their SHA-256 sums (`SHA256SUMS` in the release):
+
+| file | contents | SHA-256 |
+|---|---|---|
+| `rowsets_28.csv` | 10,034,104 row sets of Q(28) | `cbfeb0029a1f4a15a060e228ddc8751e480afbc5689d175c90648a9e18dd96d0` |
+| `manifests_28_s600.tar.gz` | 612 phase manifests | `bd8e63b3882dd337534b4df333cdb51555b84cecf2234746714a04eaf6ffaa35` |
+| `rowsets_29.csv` | 38,781,096 row sets of Q(29) | `ebbce9fa91fa84588a47983f38d1b7b7e101198d9474c5583b986cde66fb5eee` |
+| `manifests_29_s3000.tar.gz` | 3,030 phase manifests | `9964685567a2686ecbbf470c96f0d2bcc119c4c6337d97c2dff5cd648ca27d7e` |
+
+Each CSV begins with a provenance line naming the work-map fingerprint, the source commit and the binary's hash, and `--sum` on it reproduces the total, the coverage check and the mod-8 check. Q(29) has no reference value, so `--sum` prints it with "(no reference value)": the binary deliberately does not compare a count with itself.
 
 `--rowset` prints the exact line the records must contain for that row set: pick lines at random, or the heaviest, or the ones you distrust. The two leaf counts on the line can also be checked by a program of a few dozen lines that counts non-attacking placements on one colour of the given rows (the test `one_row_set_matches_a_direct_count` contains one), which tests the search without the tables or the join; the count tests all three. The whole count on a CPU is out of reach for n ≥ 26, but every part of it is within reach of anyone, which is what the per-row-set records are for.
